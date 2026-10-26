@@ -17,6 +17,15 @@ A long-form podcast: riotcoder, an AI host (an ElevenLabs agent), interviews Ant
    speaker-labelled transcript (Gemini).
 5. It waits as `ready` until `otr publish <n>` (set `OTR_AUTOPUBLISH=1` to skip).
 
+## Guests
+
+Anyone can sign up at **/guest** (free): name, phone, who they are, a topic, a link, and
+consent to be recorded and published. `otr guests` lists sign-ups; `otr record --guest <id>`
+rings that guest instead of Anthony, and the host gets `X-Otr-Guest` and `X-Otr-About`
+(`{{sip_otr_guest}}`, `{{sip_otr_about}}`) so it interviews them, not him. A guest moves
+`new` -> `booked` -> `recorded` (back to `new` on a missed call); `otr guest <id> decline`.
+Phone numbers and emails only leave through the admin API.
+
 ## Formats (A/B)
 
 Four formats in `src/variants.ts`: **riff** (Rogan-style hang, 60 min), **deep** (Fridman-style,
@@ -27,7 +36,8 @@ episode's first 7 days and web listen-through. After editing a format: `otr host
 ## CLI
 
 ```
-OTR_ADMIN_KEY=... bun bin/otr record [--topic "..."] [--variant deep]
+OTR_ADMIN_KEY=... bun bin/otr record [--topic "..."] [--variant deep] [--guest <id>]
+otr guests | guest <id> decline|new
 otr episodes | show <n> | publish <n> | unpublish <n> | title <n> <title> | stats | host sync
 ```
 
