@@ -298,7 +298,8 @@ ${transcript.slice(0, 120_000)}`
         },
         tts: { voice_id: 'iP95p4xoKVk53GoZ742B', model_id: 'eleven_flash_v2' },
         turn: { turn_timeout: 20, silence_end_call_timeout: 300 },
-        conversation: { max_duration_seconds: 7500 },
+        // ElevenLabs' ceiling, and the show's: two hours.
+        conversation: { max_duration_seconds: 7200 },
       },
     }
     const res = await this.fetch(`https://api.elevenlabs.io/v1/convai/agents/${agentId}`, {
