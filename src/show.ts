@@ -279,7 +279,7 @@ ${transcript.slice(0, 120_000)}`
             prompt: hostPrompt(),
             llm: 'claude-sonnet-5-5',
             temperature: 0.7,
-            built_in_tools: { end_call: { name: 'end_call', description: 'End the call once the episode is signed off, or when the guest asks to stop.', params: { system_tool_type: 'end_call' } } },
+            built_in_tools: { end_call: { type: 'system', name: 'end_call', description: 'End the call once the episode is signed off, or when the guest asks to stop.', params: { system_tool_type: 'end_call' } } },
             tools: [
               {
                 type: 'webhook',
