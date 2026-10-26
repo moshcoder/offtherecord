@@ -17,6 +17,7 @@ function groupcall() {
     calls.push({ method, path: u.pathname, body })
     const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status })
     if (u.pathname === '/api/v1/rooms' && method === 'POST') return json({ code: '4821' }, 201)
+    if (u.pathname === '/api/v1/rooms' && method === 'GET') return json({ rooms: [] })
     if (u.pathname === '/api/v1/rooms/4821' && method === 'GET') return json({ code: '4821', live })
     if (u.pathname.endsWith('/record')) return json({ record: true, recording: false })
     if (u.pathname.endsWith('/call')) return json({ ringing: true }, 202)
@@ -57,8 +58,8 @@ describe('an episode, start to finish', () => {
     const ep = await show.start({ topic: 'Moshpit', variant: 'deep', wait: true })
     expect(ep.n).toBe(1)
     const paths = gc.calls.map((c) => `${c.method} ${c.path}`)
-    expect(paths.slice(0, 3)).toEqual(['POST /api/v1/rooms', 'POST /api/v1/rooms/4821/record', 'POST /api/v1/rooms/4821/call'])
-    expect(gc.calls[2]!.body).toEqual({ phone: '+14085550101', name: 'Anthony' })
+    expect(paths.slice(0, 4)).toEqual(['GET /api/v1/rooms', 'POST /api/v1/rooms', 'POST /api/v1/rooms/4821/record', 'POST /api/v1/rooms/4821/call'])
+    expect(gc.calls[3]!.body).toEqual({ phone: '+14085550101', name: 'Anthony' })
     const host = gc.calls.find((c) => c.body?.sip)!
     expect(host.body.headers).toEqual({ 'X-Otr-Episode': '1', 'X-Otr-Style': 'deep', 'X-Otr-Minutes': '90', 'X-Otr-Topic': 'Moshpit' })
     expect(store.episode(1)!.status).toBe('live')
@@ -66,7 +67,7 @@ describe('an episode, start to finish', () => {
     // A second episode cannot start over a live one.
     expect((await req('POST', '/api/v1/episodes', {})).status).toBe(409)
 
-    gc.setRecordings([{ id: 'rec_1', status: 'ready', mp3: 'https://gc.test/api/v1/recordings/rec_1.mp3', duration_secs: 5400, started_at: '' }])
+    gc.setRecordings([{ id: 'rec_1', status: 'ready', mp3: 'https://gc.test/api/v1/recordings/rec_1.mp3', duration_secs: 5400, started_at: new Date().toISOString() }, { id: 'rec_old', status: 'ready', mp3: 'https://gc.test/old.mp3', duration_secs: 9000, started_at: '2020-01-01T00:00:00Z' }])
     await show.tick()
     const ready = store.episode(1)!
     expect(ready.status).toBe('ready')

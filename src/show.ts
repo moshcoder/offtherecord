@@ -48,6 +48,7 @@ export class ShowError extends Error {
 }
 
 const HOST_NAME = 'riotcoder (host)'
+const ROOM_NAME = 'Off The Record'
 
 export class Show {
   constructor(
@@ -91,7 +92,9 @@ export class Show {
     const topic = (opts.topic ?? '').replace(/\s+/g, ' ').trim().slice(0, 180) || pickTopic(all.map((e) => e.topic))
     const ep = this.store.addEpisode({ topic, variant: v })
     try {
-      const room = await this.gc<{ code: string }>('POST', '/api/v1/rooms', { name: `Off The Record #${ep.n}` })
+      // One room for the show (an account has only a few); recordings are told apart by when they started.
+      const { rooms } = await this.gc<{ rooms: { code: string; name: string }[] }>('GET', '/api/v1/rooms')
+      const room = rooms.find((r) => r.name === ROOM_NAME) ?? (await this.gc<{ code: string }>('POST', '/api/v1/rooms', { name: ROOM_NAME }))
       this.store.update(ep.n, { room: room.code })
       await this.gc('POST', `/api/v1/rooms/${room.code}/record`, { on: true })
       await this.gc('POST', `/api/v1/rooms/${room.code}/call`, { phone: this.config.guestPhone, name: this.config.guestName })
@@ -162,11 +165,13 @@ export class Show {
 
   private async collect(ep: Episode): Promise<void> {
     const { recordings } = await this.gc<{ recordings: { id: string; status: string; mp3: string | null; duration_secs: number | null; started_at: string }[] }>('GET', `/api/v1/rooms/${ep.room}/recordings`)
-    // The longest one: a dropped and re-dialled call can leave a short stub first.
-    const ready = recordings.filter((r) => r.status === 'ready' && r.mp3).sort((a, b) => (b.duration_secs ?? 0) - (a.duration_secs ?? 0))[0]
+    // This episode's: started after it was, in the show's shared room. The longest
+    // one, since a dropped and re-dialled call can leave a short stub first.
+    const mine = recordings.filter((r) => Date.parse(r.started_at) >= ep.createdAt - 60_000 || !r.started_at)
+    const ready = mine.filter((r) => r.status === 'ready' && r.mp3).sort((a, b) => (b.duration_secs ?? 0) - (a.duration_secs ?? 0))[0]
     if (!ready) {
-      if (recordings.some((r) => r.status === 'failed') && !recordings.some((r) => r.status === 'recording' || r.status === 'saving')) this.store.update(ep.n, { status: 'failed', note: 'group.call could not save the recording' })
-      else if (ep.status === 'live' && recordings.length && !recordings.some((r) => r.status === 'recording')) this.store.update(ep.n, { status: 'saving' })
+      if (mine.some((r) => r.status === 'failed') && !mine.some((r) => r.status === 'recording' || r.status === 'saving')) this.store.update(ep.n, { status: 'failed', note: 'group.call could not save the recording' })
+      else if (ep.status === 'live' && mine.length && !mine.some((r) => r.status === 'recording')) this.store.update(ep.n, { status: 'saving' })
       return
     }
     this.store.update(ep.n, { status: 'saving', recordingId: ready.id, endedAt: Date.now() })
