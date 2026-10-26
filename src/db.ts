@@ -26,6 +26,23 @@ export type Episode = {
   hostJoinedAt: number | null
   endedAt: number | null
   publishedAt: number | null
+  /** Who was interviewed: a row in guests, or null for Anthony (the show's default guest). */
+  guestId: number | null
+}
+
+export type GuestStatus = 'new' | 'booked' | 'recorded' | 'declined'
+
+/** Someone who asked to be on the show, from /guest. Phone and email are never shown publicly. */
+export type Guest = {
+  id: number
+  name: string
+  phone: string
+  email: string
+  about: string
+  topic: string
+  link: string
+  status: GuestStatus
+  createdAt: number
 }
 
 export type ArmStats = { variant: string; episodes: number; avgMinutes: number | null; downloads: number; downloadsPerEpisode: number | null; listeners: number; completion: number | null }
@@ -70,17 +87,30 @@ export class Store {
         at INTEGER NOT NULL,
         PRIMARY KEY (n, listener)
       );
+      CREATE TABLE IF NOT EXISTS guests (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        phone TEXT NOT NULL,
+        email TEXT NOT NULL DEFAULT '',
+        about TEXT NOT NULL DEFAULT '',
+        topic TEXT NOT NULL DEFAULT '',
+        link TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'new',
+        created_at INTEGER NOT NULL
+      );
     `)
+    // Added after episode 1 shipped.
+    if (!(this.db.query('PRAGMA table_info(episodes)').all() as any[]).some((c) => c.name === 'guest_id')) this.db.exec('ALTER TABLE episodes ADD COLUMN guest_id INTEGER')
   }
 
   private toEpisode(r: any): Episode | null {
     return r
-      ? { n: r.n, title: r.title, topic: r.topic, variant: r.variant, status: r.status, room: r.room, recordingId: r.recording_id, audioPath: r.audio_path, audioBytes: r.audio_bytes, durationSecs: r.duration_secs, notes: r.notes, transcript: r.transcript, note: r.note, createdAt: r.created_at, hostJoinedAt: r.host_joined_at, endedAt: r.ended_at, publishedAt: r.published_at }
+      ? { n: r.n, title: r.title, topic: r.topic, variant: r.variant, status: r.status, room: r.room, recordingId: r.recording_id, audioPath: r.audio_path, audioBytes: r.audio_bytes, durationSecs: r.duration_secs, notes: r.notes, transcript: r.transcript, note: r.note, createdAt: r.created_at, hostJoinedAt: r.host_joined_at, endedAt: r.ended_at, publishedAt: r.published_at, guestId: r.guest_id ?? null }
       : null
   }
 
-  addEpisode(e: { topic: string; variant: string }, now = Date.now()): Episode {
-    const row: any = this.db.query('INSERT INTO episodes (n, topic, variant, created_at) VALUES ((SELECT COALESCE(MAX(n), 0) + 1 FROM episodes), ?, ?, ?) RETURNING n').get(e.topic, e.variant, now)
+  addEpisode(e: { topic: string; variant: string; guestId?: number | null }, now = Date.now()): Episode {
+    const row: any = this.db.query('INSERT INTO episodes (n, topic, variant, created_at, guest_id) VALUES ((SELECT COALESCE(MAX(n), 0) + 1 FROM episodes), ?, ?, ?, ?) RETURNING n').get(e.topic, e.variant, now, e.guestId ?? null)
     return this.episode(row.n)!
   }
 
@@ -102,6 +132,41 @@ export class Store {
     const keys = Object.keys(patch).filter((k) => k in cols)
     if (keys.length) this.db.query(`UPDATE episodes SET ${keys.map((k) => `${cols[k]} = ?`).join(', ')} WHERE n = ?`).run(...keys.map((k) => (patch as any)[k] ?? null), n)
     return this.episode(n)!
+  }
+
+  // ---- guests ----------------------------------------------------------------------
+
+  private toGuest(r: any): Guest | null {
+    return r ? { id: r.id, name: r.name, phone: r.phone, email: r.email, about: r.about, topic: r.topic, link: r.link, status: r.status, createdAt: r.created_at } : null
+  }
+
+  /** A sign-up; the same phone signing up again updates its row instead of adding one. */
+  addGuest(g: Omit<Guest, 'id' | 'status' | 'createdAt'>, now = Date.now()): Guest {
+    const old: any = this.db.query("SELECT id FROM guests WHERE phone = ? AND status IN ('new', 'booked')").get(g.phone)
+    if (old) {
+      this.db.query('UPDATE guests SET name = ?, email = ?, about = ?, topic = ?, link = ? WHERE id = ?').run(g.name, g.email, g.about, g.topic, g.link, old.id)
+      return this.guest(old.id)!
+    }
+    const row: any = this.db.query('INSERT INTO guests (name, phone, email, about, topic, link, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id').get(g.name, g.phone, g.email, g.about, g.topic, g.link, now)
+    return this.guest(row.id)!
+  }
+
+  guest(id: number): Guest | null {
+    return this.toGuest(this.db.query('SELECT * FROM guests WHERE id = ?').get(id))
+  }
+
+  guests(): Guest[] {
+    return (this.db.query('SELECT * FROM guests ORDER BY id DESC').all() as any[]).map((r) => this.toGuest(r)!)
+  }
+
+  setGuestStatus(id: number, status: GuestStatus): Guest | null {
+    this.db.query('UPDATE guests SET status = ? WHERE id = ?').run(status, id)
+    return this.guest(id)
+  }
+
+  /** Sign-ups in the last hour, for a cheap flood limit on the public form. */
+  recentGuests(sinceMs: number): number {
+    return (this.db.query('SELECT COUNT(*) AS c FROM guests WHERE created_at >= ?').get(sinceMs) as any).c
   }
 
   /** One download per listener per episode per day; true when it was new. */

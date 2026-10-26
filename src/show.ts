@@ -20,7 +20,7 @@ export type Config = {
   audioDir: string
   groupcallUrl: string
   groupcallKey: string
-  /** The guest's phone, E.164. */
+  /** The default guest's (Anthony's) phone, E.164; signed-up guests bring their own. */
   guestPhone: string
   guestName: string
   /** The host agent's SIP URI, e.g. sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp */
@@ -48,6 +48,10 @@ export class ShowError extends Error {
 }
 
 const HOST_NAME = 'riotcoder (host)'
+const DEFAULT_GUEST = 'Anthony Ettinger'
+
+/** A SIP header value: one line of printable ASCII, short. */
+const sipValue = (s: string, max: number) => s.normalize('NFKD').replace(/[^\x20-\x7e]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max)
 const ROOM_NAME = 'Off The Record'
 
 export class Show {
@@ -85,19 +89,22 @@ export class Show {
    * Start an episode: make the room, ring the guest. The host is dialled in by
    * `bringHost` once the guest is on the line (awaited here only in tests).
    */
-  async start(opts: { topic?: string; variant?: string; wait?: boolean } = {}): Promise<Episode> {
+  async start(opts: { topic?: string; variant?: string; guest?: number; wait?: boolean } = {}): Promise<Episode> {
     if (this.store.inStatus('calling', 'live').length) throw new ShowError('An episode is already being recorded.', 409)
+    const guest = opts.guest ? this.store.guest(opts.guest) : null
+    if (opts.guest && !guest) throw new ShowError('No such guest.', 404)
     const all = this.store.episodes()
     const v = opts.variant ? variant(opts.variant).key : pickVariant(all.map((e) => ({ variant: e.variant, n: e.n })))
-    const topic = (opts.topic ?? '').replace(/\s+/g, ' ').trim().slice(0, 180) || pickTopic(all.map((e) => e.topic))
-    const ep = this.store.addEpisode({ topic, variant: v })
+    const topic = (opts.topic ?? guest?.topic ?? '').replace(/\s+/g, ' ').trim().slice(0, 180) || pickTopic(all.map((e) => e.topic))
+    const ep = this.store.addEpisode({ topic, variant: v, guestId: guest?.id ?? null })
     try {
       // One room for the show (an account has only a few); recordings are told apart by when they started.
       const { rooms } = await this.gc<{ rooms: { code: string; name: string }[] }>('GET', '/api/v1/rooms')
       const room = rooms.find((r) => r.name === ROOM_NAME) ?? (await this.gc<{ code: string }>('POST', '/api/v1/rooms', { name: ROOM_NAME }))
       this.store.update(ep.n, { room: room.code })
       await this.gc('POST', `/api/v1/rooms/${room.code}/record`, { on: true })
-      await this.gc('POST', `/api/v1/rooms/${room.code}/call`, { phone: this.config.guestPhone, name: this.config.guestName })
+      await this.gc('POST', `/api/v1/rooms/${room.code}/call`, { phone: guest?.phone ?? this.config.guestPhone, name: guest?.name ?? this.config.guestName })
+      if (guest) this.store.setGuestStatus(guest.id, 'booked')
       this.log(`episode ${ep.n} (${v}): ringing the guest into room ${room.code}`)
     } catch (e) {
       this.store.update(ep.n, { status: 'failed', note: e instanceof Error ? e.message : String(e) })
@@ -117,10 +124,18 @@ export class Show {
       const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`).catch(() => null)
       if (room?.live?.some((p) => p.kind === 'person')) {
         const v = variant(ep.variant)
+        const guest = ep.guestId ? this.store.guest(ep.guestId) : null
         await this.gc('POST', `/api/v1/rooms/${ep.room}/call`, {
           sip: this.config.hostSip,
           name: HOST_NAME,
-          headers: { 'X-Otr-Episode': String(ep.n), 'X-Otr-Style': v.key, 'X-Otr-Minutes': String(v.minutes), 'X-Otr-Topic': ep.topic.slice(0, 180) },
+          headers: {
+            'X-Otr-Episode': String(ep.n),
+            'X-Otr-Style': v.key,
+            'X-Otr-Minutes': String(v.minutes),
+            'X-Otr-Topic': sipValue(ep.topic, 180),
+            'X-Otr-Guest': sipValue(guest?.name ?? DEFAULT_GUEST, 80) || 'our guest',
+            'X-Otr-About': guest ? sipValue([guest.about, guest.link].filter(Boolean).join(' '), 600) || 'nothing yet' : 'the show founder',
+          },
         })
         this.store.update(n, { status: 'live', hostJoinedAt: Date.now() })
         this.log(`episode ${n}: the guest is on; host dialled in`)
@@ -129,6 +144,7 @@ export class Show {
       await new Promise((ok) => setTimeout(ok, 3000))
     }
     this.store.update(n, { status: 'missed', note: 'the guest did not pick up' })
+    if (ep.guestId) this.store.setGuestStatus(ep.guestId, 'new')
     this.log(`episode ${n}: the guest did not pick up`)
   }
 
@@ -141,7 +157,7 @@ export class Show {
     const remaining = target - elapsed
     const advice =
       remaining <= 0
-        ? 'Time is up. Wrap up now: one closing question, thank him, sign off, end the call.'
+        ? 'Time is up. Wrap up now: one closing question, thank them, sign off, end the call.'
         : remaining <= 5
           ? 'About five minutes left. Start wrapping up: closing question next.'
           : remaining <= 15
@@ -186,6 +202,7 @@ export class Show {
     const transcript = lines.lines.map((l) => `${l.who}: ${l.text}`).join('\n')
     const { title, notes } = await this.writeNotes(ep, transcript)
     this.store.update(ep.n, { status: 'ready', audioPath: out, audioBytes: Bun.file(out).size, durationSecs: durationSecs ?? null, transcript, title, notes })
+    if (ep.guestId) this.store.setGuestStatus(ep.guestId, 'recorded')
     this.log(`episode ${ep.n} is ready: ${title}`)
     if (this.config.autopublish) this.publish(ep.n)
   }
@@ -219,9 +236,10 @@ export class Show {
 
   /** A title and show notes from the transcript (Gemini); plain fallbacks without it. */
   async writeNotes(ep: Episode, transcript: string): Promise<{ title: string; notes: string }> {
-    const fallback = { title: ep.topic, notes: `${variant(ep.variant).name}: Anthony Ettinger on ${ep.topic}.` }
+    const guest = (ep.guestId ? this.store.guest(ep.guestId)?.name : null) ?? DEFAULT_GUEST
+    const fallback = { title: ep.topic, notes: `${variant(ep.variant).name}: ${guest} on ${ep.topic}.` }
     if (!this.config.geminiKey || transcript.length < 200) return fallback
-    const prompt = `You write titles and show notes for "Off The Record", a podcast where the AI host riotcoder interviews Anthony Ettinger (founder of Profullstack) about fleet engineering, agentic coding bots and building a new internet.
+    const prompt = `You write titles and show notes for "Off The Record", a podcast where the AI host riotcoder interviews builders about fleet engineering, agentic coding bots and building a new internet. This episode's guest is ${guest}${guest === DEFAULT_GUEST ? ' (founder of Profullstack, the show\'s founder)' : ''}.
 
 From this transcript (machine-transcribed, so fix obvious mishearings of names), write JSON: {"title": a specific, curious title under 70 characters, no clickbait, no episode number, "notes": 3 to 5 short paragraphs of plain-text show notes: what was discussed, the best story or quote, and what listeners will take away. No markdown, no emoji, no em dashes.}
 
@@ -267,7 +285,7 @@ ${transcript.slice(0, 120_000)}`
   async syncHost(): Promise<{ agent_id: string }> {
     const { elevenlabsKey: key, agentId } = this.config
     if (!key || !agentId) throw new ShowError('ELEVENLABS_API_KEY and OTR_AGENT_ID are needed.', 503)
-    const placeholders = { sip_otr_episode: '0', sip_otr_style: 'riff', sip_otr_minutes: '60', sip_otr_topic: 'building with AI agents' }
+    const placeholders = { sip_otr_episode: '0', sip_otr_style: 'riff', sip_otr_minutes: '60', sip_otr_topic: 'building with AI agents', sip_otr_guest: DEFAULT_GUEST, sip_otr_about: 'the show founder' }
     const body = {
       name: 'Off The Record host',
       conversation_config: {

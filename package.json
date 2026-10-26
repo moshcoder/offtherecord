@@ -1,7 +1,7 @@
 {
   "name": "@profullstack/offtherecord",
-  "version": "0.1.0",
-  "description": "Off The Record: a long-form podcast where an AI host (an ElevenLabs agent) interviews Anthony Ettinger over a recorded group.call phone line. Episodes, podcast feed, A/B formats, CLI.",
+  "version": "0.2.0",
+  "description": "Off The Record: a long-form podcast where an AI host (an ElevenLabs agent) interviews Anthony Ettinger and signed-up guests over a recorded group.call phone line. Episodes, podcast feed, A/B formats, CLI.",
   "license": "MIT",
   "type": "module",
   "private": true,

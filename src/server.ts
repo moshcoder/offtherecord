@@ -9,7 +9,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { Hono, type Context } from 'hono'
 import { Store } from './db.js'
-import { episodePage, feedXml, homePage, SITE, statsPage } from './html.js'
+import { episodePage, feedXml, guestPage, guestThanksPage, homePage, SITE, statsPage, type GuestForm } from './html.js'
 import { startPitFooterRefresh } from './pit-footer.js'
 import { RING_PLACEHOLDER, ringBar, startRingRefresh, visitorOnMoshpit } from './ring.js'
 import { ringDescriptor, startRingFooterRefresh } from './ring-footer.js'
@@ -23,7 +23,7 @@ const SELF = 'offtherecord.podcast'
 const SHORT_NAMES = ['otr.podcast', 'otr.podcast.pit.world']
 
 const SECURITY_HEADERS: Record<string, string> = {
-  'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' https://built.indie.pit.world https://pwamart.com; media-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' https://built.indie.pit.world https://pwamart.com; media-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
   'referrer-policy': 'strict-origin-when-cross-origin',
   'x-content-type-options': 'nosniff',
 }
@@ -35,6 +35,22 @@ const same = (a: string, b: string) => {
   const y = Buffer.from(b)
   return x.length === y.length && timingSafeEqual(x, y)
 }
+
+/**
+ * A phone number as E.164, or null. Ten digits are taken as US/Canada; anything
+ * else needs its country code.
+ */
+export function normalizePhone(raw: string): string | null {
+  const plus = raw.trim().startsWith('+')
+  const digits = raw.replace(/\D/g, '')
+  if (!plus && digits.length === 10) return `+1${digits}`
+  if (!plus && digits.length === 11 && digits.startsWith('1')) return `+${digits}`
+  if (plus && digits.length >= 8 && digits.length <= 15 && !digits.startsWith('0')) return `+${digits}`
+  return null
+}
+
+/** Sign-ups accepted per hour, all guests together: a cap on a flood, not on people. */
+const GUESTS_PER_HOUR = 30
 
 export function createApp(deps: { store: Store; config: Config; adminKey: string; salt: string }) {
   const { store, config } = deps
@@ -65,12 +81,40 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
   app.get('/robots.txt', (c) => c.text(`User-agent: *\nDisallow: /api/\nSitemap: ${SITE}/sitemap.xml\n`))
   app.get('/sitemap.xml', (c) =>
     c.body(
-      `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['/', '/stats', ...store.episodes({ published: true }).map((e) => `/e/${e.n}`)].map((p) => `<url><loc>${SITE}${p}</loc></url>`).join('')}</urlset>`,
+      `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['/', '/guest', '/stats', ...store.episodes({ published: true }).map((e) => `/e/${e.n}`)].map((p) => `<url><loc>${SITE}${p}</loc></url>`).join('')}</urlset>`,
       200,
       { 'content-type': 'application/xml' },
     ),
   )
   app.get('/:file{cover(-300)?\\.jpg}', (c) => new Response(Bun.file(new URL(`../public/${c.req.param('file')}`, import.meta.url).pathname), { headers: { 'content-type': 'image/jpeg', 'cache-control': 'public, max-age=86400' } }))
+
+  app.get('/guest', (c) => html(c, guestPage()))
+  app.post('/guest', async (c) => {
+    const b = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+    const field = (k: string, max: number) => String(b[k] ?? '').replace(/\s+/g, ' ').trim().slice(0, max)
+    const form: GuestForm = { name: field('name', 80), phone: field('phone', 24), email: field('email', 120), about: field('about', 600), topic: field('topic', 180), link: field('link', 200) }
+    // A filled honeypot is a bot: thank it and keep nothing.
+    if (field('website', 200)) return html(c, guestThanksPage(form.name || 'friend'))
+    const phone = normalizePhone(form.phone ?? '')
+    const error = !form.name
+      ? 'Tell us your name.'
+      : !phone
+        ? 'That phone number does not look right. Use the full number, with the country code outside the US.'
+        : !form.about
+          ? 'Tell the host who you are and what you build.'
+          : form.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email)
+            ? 'That email does not look right (it is optional).'
+            : form.link && !/^https?:\/\//i.test(form.link)
+              ? 'The link should start with https://.'
+              : b.consent !== '1'
+                ? 'Tick the box to agree to the call being recorded and published.'
+                : null
+    if (error) return html(c, guestPage({ error, form }), 400)
+    if (store.recentGuests(Date.now() - 3600_000) >= GUESTS_PER_HOUR) return html(c, guestPage({ error: 'Lots of sign-ups right now. Try again in an hour.', form }), 429)
+    const g = store.addGuest({ name: form.name!, phone: phone!, email: form.email ?? '', about: form.about!, topic: form.topic ?? '', link: form.link ?? '' })
+    console.log(`otr: guest sign-up #${g.id}: ${g.name}`)
+    return html(c, guestThanksPage(g.name))
+  })
 
   app.get('/', (c) => html(c, homePage(store.episodes({ published: true }).map((e) => ({ e, downloads: store.downloadsOf(e.n) })))))
   app.get('/stats', (c) => html(c, statsPage(store.armStats())))
@@ -143,14 +187,14 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
     }
   }
   const json = (e: ReturnType<Store['episode']>) =>
-    e && { n: e.n, title: e.title, topic: e.topic, variant: e.variant, status: e.status, room: e.room, duration_secs: e.durationSecs, note: e.note || undefined, created_at: new Date(e.createdAt).toISOString(), published_at: e.publishedAt ? new Date(e.publishedAt).toISOString() : null, page: `${SITE}/e/${e.n}`, preview: e.audioPath ? `${SITE}/api/v1/episodes/${e.n}/audio.mp3` : null }
+    e && { n: e.n, title: e.title, topic: e.topic, variant: e.variant, guest: e.guestId, status: e.status, room: e.room, duration_secs: e.durationSecs, note: e.note || undefined, created_at: new Date(e.createdAt).toISOString(), published_at: e.publishedAt ? new Date(e.publishedAt).toISOString() : null, page: `${SITE}/e/${e.n}`, preview: e.audioPath ? `${SITE}/api/v1/episodes/${e.n}/audio.mp3` : null }
 
   app.get('/api/v1/episodes', admin((c) => c.json({ episodes: store.episodes().map(json) })))
   app.post(
     '/api/v1/episodes',
     admin(async (c) => {
-      const b = (await c.req.json().catch(() => ({}))) as { topic?: string; variant?: string }
-      return c.json(json(await show.start({ ...(b.topic ? { topic: String(b.topic) } : {}), ...(b.variant ? { variant: String(b.variant) } : {}) })), 202)
+      const b = (await c.req.json().catch(() => ({}))) as { topic?: string; variant?: string; guest?: number }
+      return c.json(json(await show.start({ ...(b.topic ? { topic: String(b.topic) } : {}), ...(b.variant ? { variant: String(b.variant) } : {}), ...(b.guest ? { guest: Number(b.guest) } : {}) })), 202)
     }),
   )
   app.get('/api/v1/episodes/:n{[0-9]+}', admin((c) => c.json({ ...json(store.episode(Number(c.req.param('n')))), notes: store.episode(Number(c.req.param('n')))?.notes })))
@@ -171,6 +215,18 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
     admin((c) => {
       const e = store.episode(Number(c.req.param('n')))
       return e?.audioPath ? new Response(Bun.file(e.audioPath), { headers: { 'content-type': 'audio/mpeg' } }) : c.json({ error: 'no audio yet' }, 404)
+    }),
+  )
+  const guestJson = (g: ReturnType<Store['guest']>) => g && { id: g.id, name: g.name, phone: g.phone, email: g.email || undefined, about: g.about, topic: g.topic || undefined, link: g.link || undefined, status: g.status, created_at: new Date(g.createdAt).toISOString() }
+  app.get('/api/v1/guests', admin((c) => c.json({ guests: store.guests().map(guestJson) })))
+  app.post(
+    '/api/v1/guests/:id{[0-9]+}/status',
+    admin(async (c) => {
+      const { status } = (await c.req.json().catch(() => ({}))) as { status?: string }
+      if (!['new', 'booked', 'recorded', 'declined'].includes(String(status))) throw new ShowError('status is new, booked, recorded or declined.')
+      const g = store.setGuestStatus(Number(c.req.param('id')), status as 'new')
+      if (!g) throw new ShowError('No such guest.', 404)
+      return c.json(guestJson(g))
     }),
   )
   app.post('/api/v1/host/sync', admin(async (c) => c.json(await show.syncHost())))

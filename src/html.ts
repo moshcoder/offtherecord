@@ -47,6 +47,16 @@ pre.transcript{white-space:pre-wrap;font:14px/1.55 ui-monospace,monospace;backgr
 table{width:100%;border-collapse:collapse;font-size:.95rem}
 th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}
 .muted{color:var(--muted)}
+.btn.go{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+form.guest{display:grid;gap:14px;margin:20px 0}
+form.guest label{display:grid;gap:4px;font-weight:600}
+form.guest label span{font-weight:400;color:var(--muted);font-size:.9rem}
+form.guest input,form.guest textarea{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;width:100%}
+form.guest label.check{display:flex;gap:10px;align-items:flex-start;font-weight:400}
+form.guest label.check input{width:auto;margin-top:6px}
+form.guest button{font:inherit;justify-self:start;cursor:pointer}
+.hp{position:absolute;left:-9999px}
+.err{border:1px solid var(--accent);border-radius:10px;padding:10px 14px}
 `
 
 const BEACON = `document.querySelectorAll('audio[data-n]').forEach(function(a){var sent=0;a.addEventListener('timeupdate',function(){if(!a.duration)return;var p=Math.floor(a.currentTime/a.duration*4)*25;if(p>sent){sent=p;navigator.sendBeacon('/api/listen',JSON.stringify({n:+a.dataset.n,pct:p}))}})})`
@@ -72,7 +82,7 @@ ${o.noindex ? '<meta name="robots" content="noindex">' : `<link rel="canonical" 
 </head>
 <body>
 ${RING_PLACEHOLDER}
-<header class="top"><a class="brand" href="/">Off <b>The</b> Record</a><nav aria-label="Site"><a href="/feed.xml">RSS</a><a href="/stats">Formats</a></nav></header>
+<header class="top"><a class="brand" href="/">Off <b>The</b> Record</a><nav aria-label="Site"><a href="/guest">Be a guest</a><a href="/feed.xml">RSS</a><a href="/stats">Formats</a></nav></header>
 <main>
 ${o.body}
 </main>
@@ -103,9 +113,49 @@ export function homePage(episodes: { e: Episode; downloads: number }[]): string 
 <h1>Off The Record</h1>
 <p class="lede">${esc(TAGLINE)}</p>
 <p>${esc(AUTHOR)}, founder of Profullstack, interviewed long-form by riotcoder, the AI agent that ships his code. Recorded over a phone line on <a href="https://group.call.pit.world">group.call</a>.</p>
-<div class="subscribe"><a class="btn" href="/feed.xml">Podcast feed (RSS)</a><a class="btn" href="/stats">Which format wins?</a></div>
+<div class="subscribe"><a class="btn go" href="/guest">Be a guest (free)</a><a class="btn" href="/feed.xml">Podcast feed (RSS)</a><a class="btn" href="/stats">Which format wins?</a></div>
 <h2>Episodes</h2>
 ${episodes.length ? episodes.map(({ e, downloads }) => episodeCard(e, downloads)).join('') : '<p class="muted">The first episode is being recorded. Subscribe to the feed and it shows up in your player.</p>'}`,
+  })
+}
+
+export type GuestForm = { name?: string; phone?: string; email?: string; about?: string; topic?: string; link?: string }
+
+/** The sign-up for guests: leave a phone number and the host calls you. */
+export function guestPage(o: { error?: string; form?: GuestForm } = {}): string {
+  const f = o.form ?? {}
+  return layout({
+    title: `Be a guest on ${SHOW}`,
+    description: 'Come on Off The Record, free. An AI host calls your phone and interviews you, long-form, about what you are building with AI agents. Leave your number and it calls you.',
+    path: '/guest',
+    body: `<h1>Be a guest. It is free.</h1>
+<p class="lede">Building something with AI agents, running a fleet, or working on the new internet? Come on the show. riotcoder, the AI host, calls your phone and interviews you, long-form, 35 minutes to two hours.</p>
+<p>How it works: leave your number below. When your episode is booked, your phone rings from the show's line; press 1 and the host joins. No app, no link, no studio. The call is recorded and a person listens to it before it is published.</p>
+${o.error ? `<p class="err" role="alert">${esc(o.error)}</p>` : ''}
+<form class="guest" method="post" action="/guest">
+<label>Your name<input name="name" required maxlength="80" autocomplete="name" value="${esc(f.name)}"></label>
+<label>Phone number <span>The host calls this number. Include the country code outside the US.</span><input name="phone" type="tel" required maxlength="24" autocomplete="tel" placeholder="+1 408 555 0100" value="${esc(f.phone)}"></label>
+<label>Email <span>Optional, so we can tell you when your episode is out.</span><input name="email" type="email" maxlength="120" autocomplete="email" value="${esc(f.email)}"></label>
+<label>Who you are and what you build <span>The host reads this before the call. Two or three sentences.</span><textarea name="about" required maxlength="600" rows="4">${esc(f.about)}</textarea></label>
+<label>What you want to talk about <span>Optional.</span><input name="topic" maxlength="180" value="${esc(f.topic)}"></label>
+<label>A link <span>Your site, project or profile. Optional.</span><input name="link" type="url" maxlength="200" value="${esc(f.link)}"></label>
+<label class="hp" aria-hidden="true">Leave this empty<input name="website" tabindex="-1" autocomplete="off"></label>
+<label class="check"><input type="checkbox" name="consent" value="1" required> I agree to be called, recorded, and to have the conversation published as a podcast episode with a transcript.</label>
+<button class="btn go" type="submit">Put me on the show</button>
+</form>
+<p class="muted">Your phone number and email are never published or shared. Listen to an episode first: <a href="/">all episodes</a>.</p>`,
+  })
+}
+
+export function guestThanksPage(name: string): string {
+  return layout({
+    title: `You are on the list · ${SHOW}`,
+    description: 'Thanks for signing up to be a guest on Off The Record.',
+    path: '/guest',
+    noindex: true,
+    body: `<h1>You are on the list, ${esc(name)}.</h1>
+<p class="lede">When your episode is booked, your phone rings from the show's line. Press 1 and riotcoder, the AI host, joins and starts the interview.</p>
+<p>Pick somewhere quiet with good signal. Until then: <a href="/">listen to an episode</a> or <a href="/feed.xml">subscribe to the feed</a>.</p>`,
   })
 }
 

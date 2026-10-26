@@ -61,7 +61,7 @@ describe('an episode, start to finish', () => {
     expect(paths.slice(0, 4)).toEqual(['GET /api/v1/rooms', 'POST /api/v1/rooms', 'POST /api/v1/rooms/4821/record', 'POST /api/v1/rooms/4821/call'])
     expect(gc.calls[3]!.body).toEqual({ phone: '+14085550101', name: 'Anthony' })
     const host = gc.calls.find((c) => c.body?.sip)!
-    expect(host.body.headers).toEqual({ 'X-Otr-Episode': '1', 'X-Otr-Style': 'deep', 'X-Otr-Minutes': '90', 'X-Otr-Topic': 'Moshpit' })
+    expect(host.body.headers).toEqual({ 'X-Otr-Episode': '1', 'X-Otr-Style': 'deep', 'X-Otr-Minutes': '90', 'X-Otr-Topic': 'Moshpit', 'X-Otr-Guest': 'Anthony Ettinger', 'X-Otr-About': 'the show founder' })
     expect(store.episode(1)!.status).toBe('live')
 
     // A second episode cannot start over a live one.
@@ -121,4 +121,54 @@ test('otr.podcast redirects to the show; admin needs the key', async () => {
   expect((await app.request('/api/v1/episodes')).status).toBe(401)
   expect((await app.request('/')).status).toBe(200)
   expect((await app.request('/stats')).status).toBe(200)
+})
+
+describe('guests', () => {
+  const form = (fields: Record<string, string>) => new URLSearchParams(fields).toString()
+  const post = (app: ReturnType<typeof setup>['app'], fields: Record<string, string>) =>
+    app.request('/guest', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form(fields) })
+  const ok = { name: 'Ada', phone: '(408) 555-0199', about: 'I run a dozen coding agents on a home server.', topic: 'Agents at home', consent: '1' }
+
+  test('signs up from the form, phone made E.164, nothing private on the page', async () => {
+    const { app, store } = setup()
+    const page = await (await app.request('/guest')).text()
+    expect(page).toContain('action="/guest"')
+    const res = await post(app, ok)
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain('You are on the list, Ada.')
+    const [g] = store.guests()
+    expect(g).toMatchObject({ name: 'Ada', phone: '+14085550199', status: 'new', topic: 'Agents at home' })
+    // The same phone again updates the sign-up instead of adding one.
+    await post(app, { ...ok, about: 'Updated.' })
+    expect(store.guests().length).toBe(1)
+    expect(store.guests()[0]!.about).toBe('Updated.')
+  })
+
+  test('refuses a bad phone, missing consent, and keeps nothing from a bot', async () => {
+    const { app, store } = setup()
+    expect((await post(app, { ...ok, phone: '12345' })).status).toBe(400)
+    const noConsent = await post(app, { ...ok, consent: '' })
+    expect(noConsent.status).toBe(400)
+    expect(await noConsent.text()).toContain('value="Ada"')
+    expect((await post(app, { ...ok, website: 'http://spam.test' })).status).toBe(200)
+    expect(store.guests().length).toBe(0)
+  })
+
+  test('an episode with a guest rings their phone and tells the host who they are', async () => {
+    const { app, gc, store, req } = setup()
+    await post(app, { ...ok, phone: '+44 20 7946 0958', link: 'https://ada.test' })
+    const g = store.guests()[0]!
+    gc.setLive([{ kind: 'person', name: 'Ada' }])
+    const res = await req('POST', '/api/v1/episodes', { guest: g.id, variant: 'sprint' })
+    expect(res.status).toBe(202)
+    expect(gc.calls.find((c) => c.body?.phone)!.body).toEqual({ phone: '+442079460958', name: 'Ada' })
+    await new Promise((ok) => setTimeout(ok, 20))
+    const host = gc.calls.find((c) => c.body?.sip)!
+    expect(host.body.headers).toMatchObject({ 'X-Otr-Guest': 'Ada', 'X-Otr-Topic': 'Agents at home', 'X-Otr-About': 'I run a dozen coding agents on a home server. https://ada.test' })
+    expect(store.guest(g.id)!.status).toBe('booked')
+    expect(store.episode(1)!.guestId).toBe(g.id)
+    const list = await (await req('GET', '/api/v1/guests')).json()
+    expect(list.guests[0].phone).toBe('+442079460958')
+    expect((await app.request('/api/v1/guests')).status).toBe(401)
+  })
 })

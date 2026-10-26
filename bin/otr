@@ -2,8 +2,10 @@
 /**
  * otr: run Off The Record from the terminal.
  *
- *   otr record [--topic "..."] [--variant riff|deep|sprint|marathon]
- *       ring Anthony into a recorded room; the host dials in when he picks up
+ *   otr record [--topic "..."] [--variant riff|deep|sprint|marathon] [--guest <id>]
+ *       ring Anthony (or a signed-up guest) into a recorded room; the host dials in on pickup
+ *   otr guests                   sign-ups from /guest, newest first
+ *   otr guest <id> decline|new   mark a sign-up
  *   otr episodes                 every episode and its state
  *   otr show <n>                 one episode, with its show notes
  *   otr publish <n> | unpublish <n>
@@ -31,8 +33,20 @@ const line = (e: any) => `#${String(e.n).padEnd(3)} ${e.status.padEnd(9)} ${e.va
 try {
   switch (cmd) {
     case 'record': {
-      const e = await call('POST', '/api/v1/episodes', { ...(flag('topic') ? { topic: flag('topic') } : {}), ...(flag('variant') ? { variant: flag('variant') } : {}) })
-      console.log(`episode ${e.n} (${e.variant}): ringing Anthony into group.call room ${e.room}. Press 1 to join; the host dials in after.`)
+      const e = await call('POST', '/api/v1/episodes', { ...(flag('topic') ? { topic: flag('topic') } : {}), ...(flag('variant') ? { variant: flag('variant') } : {}), ...(flag('guest') ? { guest: Number(flag('guest')) } : {}) })
+      console.log(`episode ${e.n} (${e.variant}): ringing ${e.guest ? `guest #${e.guest}` : 'Anthony'} into group.call room ${e.room}. Press 1 to join; the host dials in after.`)
+      break
+    }
+    case 'guests':
+      console.log(
+        (await call('GET', '/api/v1/guests')).guests
+          .map((g: any) => `#${String(g.id).padEnd(3)} ${g.status.padEnd(9)} ${g.name} ${g.phone}${g.email ? ` ${g.email}` : ''}\n     ${g.about}${g.topic ? `\n     topic: ${g.topic}` : ''}${g.link ? `\n     ${g.link}` : ''}`)
+          .join('\n') || 'no sign-ups yet: share https://offtherecord.podcast.pit.world/guest',
+      )
+      break
+    case 'guest': {
+      const g = await call('POST', `/api/v1/guests/${rest[0]}/status`, { status: rest[1] })
+      console.log(`#${g.id} ${g.name}: ${g.status}`)
       break
     }
     case 'episodes':
@@ -59,7 +73,7 @@ try {
       console.log(await call('POST', '/api/v1/host/sync'))
       break
     default:
-      console.log((await Bun.file(import.meta.path).text()).split('\n').slice(2, 16).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
+      console.log((await Bun.file(import.meta.path).text()).split('\n').slice(2, 18).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
   }
 } catch (e) {
   console.error(`otr: ${e instanceof Error ? e.message : e}`)
