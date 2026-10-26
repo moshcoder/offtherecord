@@ -74,7 +74,7 @@ export function pickVariant(history: { variant: string; n: number }[], arms: rea
 
 /** Topics to fall back on when an episode is started without one. */
 export const TOPICS = [
-  'How one veteran programmer runs a fleet of about 170 repos with AI agents',
+  'How one veteran programmer runs a fleet of 300+ repos with AI agents',
   'Moshpit: building a new internet of names on top of the old one',
   'Agentic coding bots: what they are good at, what they break, how to keep them honest',
   'CoinPay and crypto payments for the small web',
@@ -91,7 +91,7 @@ export function pickTopic(used: string[]): string {
 /** What the host knows about the guest. Only what is on the record; it asks for the rest. */
 export const DOSSIER = `Guest: Anthony Ettinger, founder of Profullstack, Inc., a Silicon Valley veteran programmer.
 What is on the record (do not invent more; ask him for dates, numbers and stories):
-- Profullstack runs a "fleet": about 170 active repos and close to a hundred live sites and services, built and operated largely by AI coding agents he directs.
+- Profullstack runs a "fleet": over 300 repos and about 90 active domains, built and operated largely by AI coding agents he directs.
 - His main agent is riotcoder (that is you, the host, in another role: you may joke about interviewing your own boss). Another agent, cha0spunk, works the inbound queue: email, support, follow-ups.
 - Moshpit: an alternative naming layer for a "new internet": thousands of new endings (like .podcast, .agent, .hacker) on top of the old one, reachable from the regular web through pit.world.
 - CoinPay: crypto payments, and the sign-in hub across the fleet.
