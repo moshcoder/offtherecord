@@ -1,0 +1,123 @@
+import { describe, expect, test } from 'bun:test'
+import { Store } from '../src/db.ts'
+import { createApp } from '../src/server.ts'
+import { pickVariant } from '../src/variants.ts'
+
+const MP3 = new Uint8Array(1000).map((_, i) => i % 251)
+
+/** A fake group.call: records calls, answers like the real API. */
+function groupcall() {
+  const calls: { method: string; path: string; body: any }[] = []
+  let live: { kind: string; name: string }[] = []
+  let recordings: any[] = []
+  const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const u = new URL(String(url))
+    const method = init?.method ?? 'GET'
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined
+    calls.push({ method, path: u.pathname, body })
+    const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status })
+    if (u.pathname === '/api/v1/rooms' && method === 'POST') return json({ code: '4821' }, 201)
+    if (u.pathname === '/api/v1/rooms/4821' && method === 'GET') return json({ code: '4821', live })
+    if (u.pathname.endsWith('/record')) return json({ record: true, recording: false })
+    if (u.pathname.endsWith('/call')) return json({ ringing: true }, 202)
+    if (u.pathname.endsWith('/recordings')) return json({ recordings })
+    if (u.pathname.endsWith('/transcript')) return json({ lines: [{ who: 'riotcoder (host)', text: 'Welcome.', at: '' }, { who: 'Anthony', text: 'Thanks.', at: '' }] })
+    if (u.pathname === '/api/v1/recordings/rec_1.mp3') return new Response(MP3)
+    return json({ error: 'not found' }, 404)
+  }) as unknown as typeof globalThis.fetch
+  return { calls, fetch, setLive: (l: typeof live) => (live = l), setRecordings: (r: any[]) => (recordings = r) }
+}
+
+function setup() {
+  const gc = groupcall()
+  const store = new Store(':memory:')
+  const dir = `${process.env.TMPDIR ?? '/tmp'}/otr-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const { app, show } = createApp({
+    store,
+    adminKey: 'admin',
+    salt: 'salt',
+    config: { origin: 'https://otr.test', audioDir: dir, groupcallUrl: 'https://gc.test', groupcallKey: 'gc_x', guestPhone: '+14085550101', guestName: 'Anthony', hostSip: 'sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp', hostToolSecret: 'tool', fetch: gc.fetch, ffmpeg: null, answerTimeoutMs: 50, log: () => {} },
+  })
+  const req = (method: string, path: string, body?: unknown, headers: Record<string, string> = {}) =>
+    app.request(path, { method, headers: { authorization: 'Bearer admin', ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, ...(body ? { body: JSON.stringify(body) } : {}) })
+  return { gc, store, app, show, req }
+}
+
+test('formats alternate between the two arms under test, least used first', () => {
+  expect(pickVariant([])).toBe('riff')
+  expect(pickVariant([{ variant: 'riff', n: 1 }])).toBe('deep')
+  expect(pickVariant([{ variant: 'riff', n: 1 }, { variant: 'deep', n: 2 }])).toBe('riff')
+  expect(pickVariant([{ variant: 'deep', n: 1 }, { variant: 'riff', n: 2 }])).toBe('deep')
+})
+
+describe('an episode, start to finish', () => {
+  test('rings the guest, dials the host in with the episode in X- headers, picks up the mp3, waits for publish', async () => {
+    const { gc, store, show, req, app } = setup()
+    gc.setLive([{ kind: 'person', name: 'Anthony' }])
+    const ep = await show.start({ topic: 'Moshpit', variant: 'deep', wait: true })
+    expect(ep.n).toBe(1)
+    const paths = gc.calls.map((c) => `${c.method} ${c.path}`)
+    expect(paths.slice(0, 3)).toEqual(['POST /api/v1/rooms', 'POST /api/v1/rooms/4821/record', 'POST /api/v1/rooms/4821/call'])
+    expect(gc.calls[2]!.body).toEqual({ phone: '+14085550101', name: 'Anthony' })
+    const host = gc.calls.find((c) => c.body?.sip)!
+    expect(host.body.headers).toEqual({ 'X-Otr-Episode': '1', 'X-Otr-Style': 'deep', 'X-Otr-Minutes': '90', 'X-Otr-Topic': 'Moshpit' })
+    expect(store.episode(1)!.status).toBe('live')
+
+    // A second episode cannot start over a live one.
+    expect((await req('POST', '/api/v1/episodes', {})).status).toBe(409)
+
+    gc.setRecordings([{ id: 'rec_1', status: 'ready', mp3: 'https://gc.test/api/v1/recordings/rec_1.mp3', duration_secs: 5400, started_at: '' }])
+    await show.tick()
+    const ready = store.episode(1)!
+    expect(ready.status).toBe('ready')
+    expect(ready.durationSecs).toBe(5400)
+    expect(ready.transcript).toContain('Anthony: Thanks.')
+    // Not public until published.
+    expect((await app.request('/audio/1.mp3')).status).toBe(404)
+    expect(await (await app.request('/feed.xml')).text()).not.toContain('<item>')
+
+    expect((await req('POST', '/api/v1/episodes/1/publish')).status).toBe(200)
+    const feed = await (await app.request('/feed.xml')).text()
+    expect(feed).toContain('<enclosure url="https://offtherecord.podcast.pit.world/audio/1.mp3" length="1000" type="audio/mpeg"/>')
+    expect(feed).toContain('<itunes:duration>01:30:00</itunes:duration>')
+
+    const whole = await app.request('/audio/1.mp3', { headers: { 'user-agent': 'Overcast/3.0' } })
+    expect(whole.status).toBe(200)
+    expect(new Uint8Array(await whole.arrayBuffer()).length).toBe(1000)
+    const part = await app.request('/audio/1.mp3', { headers: { range: 'bytes=10-19' } })
+    expect(part.status).toBe(206)
+    expect(part.headers.get('content-range')).toBe('bytes 10-19/1000')
+    expect([...new Uint8Array(await part.arrayBuffer())]).toEqual([...MP3.slice(10, 20)])
+    expect(store.downloadsOf(1)).toBe(1)
+    await app.request('/audio/1.mp3', { headers: { 'user-agent': 'Overcast/3.0' } })
+    expect(store.downloadsOf(1)).toBe(1)
+    expect((await app.request('/e/1')).status).toBe(200)
+  })
+
+  test('a guest who never picks up leaves the episode missed, and no host is dialled', async () => {
+    const { gc, store, show } = setup()
+    await show.start({ wait: true })
+    expect(store.episode(1)!.status).toBe('missed')
+    expect(gc.calls.some((c) => c.body?.sip)).toBe(false)
+  })
+})
+
+test("the host's clock says when to wrap up, and only the host can read it", async () => {
+  const { store, app, show } = setup()
+  const ep = store.addEpisode({ topic: 't', variant: 'sprint' })
+  store.update(ep.n, { hostJoinedAt: Date.now() - 32 * 60_000 })
+  expect(show.clock(ep.n).advice).toMatch(/Start wrapping up/)
+  expect((await app.request(`/api/host/clock?episode=${ep.n}`)).status).toBe(403)
+  const r = await app.request(`/api/host/clock?episode=${ep.n}`, { headers: { 'x-otr-secret': 'tool' } })
+  expect(((await r.json()) as any).target_minutes).toBe(35)
+})
+
+test('otr.podcast redirects to the show; admin needs the key', async () => {
+  const { app } = setup()
+  const r = await app.request('/e/3', { headers: { host: 'otr.podcast' } })
+  expect(r.status).toBe(301)
+  expect(r.headers.get('location')).toBe('https://offtherecord.podcast.pit.world/e/3')
+  expect((await app.request('/api/v1/episodes')).status).toBe(401)
+  expect((await app.request('/')).status).toBe(200)
+  expect((await app.request('/stats')).status).toBe(200)
+})

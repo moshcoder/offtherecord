@@ -1,0 +1,67 @@
+#!/usr/bin/env bun
+/**
+ * otr: run Off The Record from the terminal.
+ *
+ *   otr record [--topic "..."] [--variant riff|deep|sprint|marathon]
+ *       ring Anthony into a recorded room; the host dials in when he picks up
+ *   otr episodes                 every episode and its state
+ *   otr show <n>                 one episode, with its show notes
+ *   otr publish <n> | unpublish <n>
+ *   otr title <n> <title...>     retitle before publishing
+ *   otr stats                    plays and listen-through by format
+ *   otr host sync                push the host prompt/tools to the ElevenLabs agent
+ *
+ * OTR_ADMIN_KEY signs every call; OTR_URL points at another instance.
+ */
+const base = (process.env.OTR_URL ?? 'https://offtherecord.podcast.pit.world').replace(/\/+$/, '')
+const key = process.env.OTR_ADMIN_KEY
+const [cmd, ...rest] = process.argv.slice(2)
+const flag = (name: string) => {
+  const i = rest.indexOf(`--${name}`)
+  return i >= 0 ? rest[i + 1] : undefined
+}
+async function call(method: string, path: string, body?: unknown) {
+  if (!key) throw new Error('set OTR_ADMIN_KEY')
+  const res = await fetch(base + path, { method, headers: { authorization: `Bearer ${key}`, ...(body ? { 'content-type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) })
+  const data = (await res.json().catch(() => ({}))) as any
+  if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
+  return data
+}
+const line = (e: any) => `#${String(e.n).padEnd(3)} ${e.status.padEnd(9)} ${e.variant.padEnd(8)} ${e.duration_secs ? `${Math.round(e.duration_secs / 60)}m`.padEnd(5) : '     '} ${e.title || e.topic}`
+try {
+  switch (cmd) {
+    case 'record': {
+      const e = await call('POST', '/api/v1/episodes', { ...(flag('topic') ? { topic: flag('topic') } : {}), ...(flag('variant') ? { variant: flag('variant') } : {}) })
+      console.log(`episode ${e.n} (${e.variant}): ringing Anthony into group.call room ${e.room}. Press 1 to join; the host dials in after.`)
+      break
+    }
+    case 'episodes':
+    case 'ls':
+      console.log((await call('GET', '/api/v1/episodes')).episodes.map(line).join('\n') || 'no episodes yet: otr record')
+      break
+    case 'show': {
+      const e = await call('GET', `/api/v1/episodes/${rest[0]}`)
+      console.log(`${line(e)}\ntopic: ${e.topic}\n${e.preview ? `listen: curl -H "authorization: Bearer $OTR_ADMIN_KEY" ${e.preview} -o otr-${e.n}.mp3\n` : ''}\n${e.notes ?? ''}`)
+      break
+    }
+    case 'publish':
+    case 'unpublish':
+      console.log(line(await call('POST', `/api/v1/episodes/${rest[0]}/${cmd}`)))
+      break
+    case 'title':
+      console.log(line(await call('PATCH', `/api/v1/episodes/${rest[0]}`, { title: rest.slice(1).join(' ') })))
+      break
+    case 'stats':
+      for (const a of (await call('GET', '/api/v1/stats')).arms) console.log(`${a.variant.padEnd(9)} episodes ${a.episodes}  plays/ep ${a.downloadsPerEpisode ?? '-'}  listened ${a.completion ?? '-'}%`)
+      break
+    case 'host':
+      if (rest[0] !== 'sync') throw new Error('otr host sync')
+      console.log(await call('POST', '/api/v1/host/sync'))
+      break
+    default:
+      console.log((await Bun.file(import.meta.path).text()).split('\n').slice(2, 16).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
+  }
+} catch (e) {
+  console.error(`otr: ${e instanceof Error ? e.message : e}`)
+  process.exit(1)
+}

@@ -1,0 +1,307 @@
+/**
+ * Making an episode, start to finish.
+ *
+ * 1. `start`: a group.call room that records, ring the guest's phone (he presses
+ *    1), and once he is on the line, dial the host in: an ElevenLabs agent over
+ *    SIP, told which episode, format, topic and length in X- headers.
+ * 2. The host interviews him; it checks `clock` (a tool it calls) to land on time.
+ * 3. When the call ends group.call saves the mp3. `tick` finds it, downloads it,
+ *    levels the loudness (ffmpeg, when there is one), and writes title and show
+ *    notes from the room's speaker-labelled transcript.
+ * 4. The episode waits as "ready" until it is published (OTR_AUTOPUBLISH=1 skips
+ *    the wait): it is a recorded conversation, so a person hears it first.
+ */
+import { mkdirSync, renameSync, unlinkSync } from 'node:fs'
+import type { Episode, Store } from './db.js'
+import { FIRST_MESSAGE, hostPrompt, pickTopic, pickVariant, variant } from './variants.js'
+
+export type Config = {
+  origin: string
+  audioDir: string
+  groupcallUrl: string
+  groupcallKey: string
+  /** The guest's phone, E.164. */
+  guestPhone: string
+  guestName: string
+  /** The host agent's SIP URI, e.g. sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp */
+  hostSip: string
+  elevenlabsKey?: string
+  agentId?: string
+  /** Sent by the host's clock tool, so only it can read the clock. */
+  hostToolSecret: string
+  geminiKey?: string
+  autopublish?: boolean
+  ffmpeg?: string | null
+  fetch?: typeof fetch
+  /** How long to wait for the guest to pick up and press 1. */
+  answerTimeoutMs?: number
+  log?: (line: string) => void
+}
+
+export class ShowError extends Error {
+  constructor(
+    message: string,
+    readonly status = 400,
+  ) {
+    super(message)
+  }
+}
+
+const HOST_NAME = 'riotcoder (host)'
+
+export class Show {
+  constructor(
+    readonly store: Store,
+    readonly config: Config,
+  ) {
+    mkdirSync(config.audioDir, { recursive: true })
+  }
+
+  private get fetch(): typeof fetch {
+    return this.config.fetch ?? fetch
+  }
+
+  private log(line: string): void {
+    ;(this.config.log ?? console.log)(`otr: ${line}`)
+  }
+
+  /** group.call's API, as the show's operator account. */
+  private async gc<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await this.fetch(this.config.groupcallUrl.replace(/\/+$/, '') + path, {
+      method,
+      headers: { authorization: `Bearer ${this.config.groupcallKey}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(30_000),
+    })
+    const data = (await res.json().catch(() => ({}))) as T & { error?: string }
+    if (!res.ok) throw new ShowError(`group.call: ${data.error ?? res.status}`, 502)
+    return data
+  }
+
+  // ---- recording ----------------------------------------------------------------
+
+  /**
+   * Start an episode: make the room, ring the guest. The host is dialled in by
+   * `bringHost` once the guest is on the line (awaited here only in tests).
+   */
+  async start(opts: { topic?: string; variant?: string; wait?: boolean } = {}): Promise<Episode> {
+    if (this.store.inStatus('calling', 'live').length) throw new ShowError('An episode is already being recorded.', 409)
+    const all = this.store.episodes()
+    const v = opts.variant ? variant(opts.variant).key : pickVariant(all.map((e) => ({ variant: e.variant, n: e.n })))
+    const topic = (opts.topic ?? '').replace(/\s+/g, ' ').trim().slice(0, 180) || pickTopic(all.map((e) => e.topic))
+    const ep = this.store.addEpisode({ topic, variant: v })
+    try {
+      const room = await this.gc<{ code: string }>('POST', '/api/v1/rooms', { name: `Off The Record #${ep.n}` })
+      this.store.update(ep.n, { room: room.code })
+      await this.gc('POST', `/api/v1/rooms/${room.code}/record`, { on: true })
+      await this.gc('POST', `/api/v1/rooms/${room.code}/call`, { phone: this.config.guestPhone, name: this.config.guestName })
+      this.log(`episode ${ep.n} (${v}): ringing the guest into room ${room.code}`)
+    } catch (e) {
+      this.store.update(ep.n, { status: 'failed', note: e instanceof Error ? e.message : String(e) })
+      throw e
+    }
+    const host = this.bringHost(ep.n)
+    if (opts.wait) await host
+    else void host.catch((e) => this.log(`episode ${ep.n}: ${e}`))
+    return this.store.episode(ep.n)!
+  }
+
+  /** Wait for the guest to be on the line, then dial the host in. */
+  async bringHost(n: number): Promise<void> {
+    const ep = this.store.episode(n)!
+    const until = Date.now() + (this.config.answerTimeoutMs ?? 120_000)
+    while (Date.now() < until) {
+      const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`).catch(() => null)
+      if (room?.live?.some((p) => p.kind === 'person')) {
+        const v = variant(ep.variant)
+        await this.gc('POST', `/api/v1/rooms/${ep.room}/call`, {
+          sip: this.config.hostSip,
+          name: HOST_NAME,
+          headers: { 'X-Otr-Episode': String(ep.n), 'X-Otr-Style': v.key, 'X-Otr-Minutes': String(v.minutes), 'X-Otr-Topic': ep.topic.slice(0, 180) },
+        })
+        this.store.update(n, { status: 'live', hostJoinedAt: Date.now() })
+        this.log(`episode ${n}: the guest is on; host dialled in`)
+        return
+      }
+      await new Promise((ok) => setTimeout(ok, 3000))
+    }
+    this.store.update(n, { status: 'missed', note: 'the guest did not pick up' })
+    this.log(`episode ${n}: the guest did not pick up`)
+  }
+
+  /** For the host's check_clock tool: how far in, and whether to wrap up. */
+  clock(n: number, now = Date.now()) {
+    const ep = this.store.episode(n)
+    if (!ep) return { error: 'no such episode' }
+    const target = variant(ep.variant).minutes
+    const elapsed = ep.hostJoinedAt ? (now - ep.hostJoinedAt) / 60_000 : 0
+    const remaining = target - elapsed
+    const advice =
+      remaining <= 0
+        ? 'Time is up. Wrap up now: one closing question, thank him, sign off, end the call.'
+        : remaining <= 5
+          ? 'About five minutes left. Start wrapping up: closing question next.'
+          : remaining <= 15
+            ? 'Final stretch. No new big topics; go deeper on the current one.'
+            : 'Plenty of time. Keep going.'
+    return { elapsed_minutes: Math.round(elapsed), target_minutes: target, remaining_minutes: Math.max(0, Math.round(remaining)), advice }
+  }
+
+  // ---- after the call -------------------------------------------------------------
+
+  /** Called every minute: pick up finished recordings. */
+  async tick(): Promise<void> {
+    for (const ep of this.store.inStatus('live', 'saving')) {
+      try {
+        await this.collect(ep)
+      } catch (e) {
+        this.log(`episode ${ep.n}: ${e instanceof Error ? e.message : e}`)
+      }
+    }
+  }
+
+  private async collect(ep: Episode): Promise<void> {
+    const { recordings } = await this.gc<{ recordings: { id: string; status: string; mp3: string | null; duration_secs: number | null; started_at: string }[] }>('GET', `/api/v1/rooms/${ep.room}/recordings`)
+    // The longest one: a dropped and re-dialled call can leave a short stub first.
+    const ready = recordings.filter((r) => r.status === 'ready' && r.mp3).sort((a, b) => (b.duration_secs ?? 0) - (a.duration_secs ?? 0))[0]
+    if (!ready) {
+      if (recordings.some((r) => r.status === 'failed') && !recordings.some((r) => r.status === 'recording' || r.status === 'saving')) this.store.update(ep.n, { status: 'failed', note: 'group.call could not save the recording' })
+      else if (ep.status === 'live' && recordings.length && !recordings.some((r) => r.status === 'recording')) this.store.update(ep.n, { status: 'saving' })
+      return
+    }
+    this.store.update(ep.n, { status: 'saving', recordingId: ready.id, endedAt: Date.now() })
+    const res = await this.fetch(ready.mp3!, { headers: { authorization: `Bearer ${this.config.groupcallKey}` } })
+    if (!res.ok) throw new Error(`mp3 download ${res.status}`)
+    const raw = `${this.config.audioDir}/${ep.n}.raw.mp3`
+    const out = `${this.config.audioDir}/${ep.n}.mp3`
+    await Bun.write(raw, await res.arrayBuffer())
+    await this.master(raw, out)
+    const durationSecs = (await this.probe(out)) ?? ready.duration_secs
+    const lines = await this.gc<{ lines: { who: string; text: string; at: string }[] }>('GET', `/api/v1/rooms/${ep.room}/transcript?limit=5000`).catch(() => ({ lines: [] }))
+    const transcript = lines.lines.map((l) => `${l.who}: ${l.text}`).join('\n')
+    const { title, notes } = await this.writeNotes(ep, transcript)
+    this.store.update(ep.n, { status: 'ready', audioPath: out, audioBytes: Bun.file(out).size, durationSecs: durationSecs ?? null, transcript, title, notes })
+    this.log(`episode ${ep.n} is ready: ${title}`)
+    if (this.config.autopublish) this.publish(ep.n)
+  }
+
+  /**
+   * Level the loudness to podcast norm (-16 LUFS, the Apple/Spotify target), trim
+   * the silence before anybody speaks, and mono 64 kbps: it is a phone call.
+   * Without ffmpeg the call's own mp3 is used as it is.
+   */
+  private async master(raw: string, out: string): Promise<void> {
+    const ff = this.config.ffmpeg
+    if (ff) {
+      const p = Bun.spawn([ff, '-hide_banner', '-loglevel', 'error', '-y', '-i', raw, '-af', 'silenceremove=start_periods=1:start_threshold=-50dB,loudnorm=I=-16:TP=-1.5:LRA=11', '-ac', '1', '-ar', '44100', '-b:a', '64k', `${out}.tmp.mp3`], { stderr: 'pipe' })
+      if ((await p.exited) === 0) {
+        renameSync(`${out}.tmp.mp3`, out)
+        unlinkSync(raw)
+        return
+      }
+      this.log(`ffmpeg failed (${(await new Response(p.stderr).text()).slice(0, 200)}); keeping the raw call audio`)
+    }
+    renameSync(raw, out)
+  }
+
+  private async probe(path: string): Promise<number | null> {
+    const ff = this.config.ffmpeg
+    if (!ff) return null
+    const p = Bun.spawn([ff.replace(/ffmpeg$/, 'ffprobe'), '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', path], { stdout: 'pipe', stderr: 'ignore' })
+    const out = (await new Response(p.stdout).text()).trim()
+    return (await p.exited) === 0 && Number.isFinite(Number(out)) ? Math.round(Number(out)) : null
+  }
+
+  /** A title and show notes from the transcript (Gemini); plain fallbacks without it. */
+  async writeNotes(ep: Episode, transcript: string): Promise<{ title: string; notes: string }> {
+    const fallback = { title: ep.topic, notes: `${variant(ep.variant).name}: Anthony Ettinger on ${ep.topic}.` }
+    if (!this.config.geminiKey || transcript.length < 200) return fallback
+    const prompt = `You write titles and show notes for "Off The Record", a podcast where the AI host riotcoder interviews Anthony Ettinger (founder of Profullstack) about fleet engineering, agentic coding bots and building a new internet.
+
+From this transcript (machine-transcribed, so fix obvious mishearings of names), write JSON: {"title": a specific, curious title under 70 characters, no clickbait, no episode number, "notes": 3 to 5 short paragraphs of plain-text show notes: what was discussed, the best story or quote, and what listeners will take away. No markdown, no emoji, no em dashes.}
+
+Topic: ${ep.topic}
+Transcript:
+${transcript.slice(0, 120_000)}`
+    try {
+      const res = await this.fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': this.config.geminiKey },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json' } }),
+        signal: AbortSignal.timeout(90_000),
+      })
+      const data = (await res.json()) as any
+      const parsed = JSON.parse(data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}')
+      const title = String(parsed.title ?? '').trim().slice(0, 100)
+      const notes = String(parsed.notes ?? '').trim().slice(0, 5000)
+      return title && notes ? { title, notes } : fallback
+    } catch {
+      return fallback
+    }
+  }
+
+  publish(n: number): Episode {
+    const ep = this.store.episode(n)
+    if (!ep) throw new ShowError('No such episode.', 404)
+    if (ep.status !== 'ready' && ep.status !== 'published') throw new ShowError(`Episode ${n} is ${ep.status}, not ready.`, 409)
+    return this.store.update(n, { status: 'published', publishedAt: ep.publishedAt ?? Date.now() })
+  }
+
+  unpublish(n: number): Episode {
+    const ep = this.store.episode(n)
+    if (!ep) throw new ShowError('No such episode.', 404)
+    return this.store.update(n, { status: ep.audioPath ? 'ready' : ep.status })
+  }
+
+  // ---- the host agent -------------------------------------------------------------
+
+  /**
+   * Push the host's prompt, voice, tools and limits to its ElevenLabs agent. Run
+   * after changing variants.ts; the agent is otherwise left alone.
+   */
+  async syncHost(): Promise<{ agent_id: string }> {
+    const { elevenlabsKey: key, agentId } = this.config
+    if (!key || !agentId) throw new ShowError('ELEVENLABS_API_KEY and OTR_AGENT_ID are needed.', 503)
+    const placeholders = { sip_otr_episode: '0', sip_otr_style: 'riff', sip_otr_minutes: '60', sip_otr_topic: 'building with AI agents' }
+    const body = {
+      name: 'Off The Record host',
+      conversation_config: {
+        agent: {
+          first_message: FIRST_MESSAGE,
+          language: 'en',
+          dynamic_variables: { dynamic_variable_placeholders: placeholders },
+          prompt: {
+            prompt: hostPrompt(),
+            llm: 'claude-sonnet-5-5',
+            temperature: 0.7,
+            built_in_tools: { end_call: { name: 'end_call', description: 'End the call once the episode is signed off, or when the guest asks to stop.', params: { system_tool_type: 'end_call' } } },
+            tools: [
+              {
+                type: 'webhook',
+                name: 'check_clock',
+                description: 'How far into the episode you are, the target length, and whether to wrap up. Call about every ten minutes.',
+                response_timeout_secs: 10,
+                api_schema: {
+                  url: `${this.config.origin}/api/host/clock`,
+                  method: 'GET',
+                  query_params_schema: { properties: { episode: { type: 'string', dynamic_variable: 'sip_otr_episode' } }, required: ['episode'] },
+                  request_headers: { 'x-otr-secret': this.config.hostToolSecret },
+                },
+              },
+            ],
+          },
+        },
+        tts: { voice_id: 'iP95p4xoKVk53GoZ742B', model_id: 'eleven_flash_v2' },
+        turn: { turn_timeout: 20, silence_end_call_timeout: 300 },
+        conversation: { max_duration_seconds: 7500 },
+      },
+    }
+    const res = await this.fetch(`https://api.elevenlabs.io/v1/convai/agents/${agentId}`, {
+      method: 'PATCH',
+      headers: { 'xi-api-key': key, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) throw new ShowError(`ElevenLabs: ${res.status} ${(await res.text()).slice(0, 600)}`, 502)
+    return { agent_id: agentId }
+  }
+}

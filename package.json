@@ -1,0 +1,25 @@
+{
+  "name": "@profullstack/offtherecord",
+  "version": "0.1.0",
+  "description": "Off The Record: a long-form podcast where an AI host (an ElevenLabs agent) interviews Anthony Ettinger over a recorded group.call phone line. Episodes, podcast feed, A/B formats, CLI.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "homepage": "https://offtherecord.podcast.pit.world",
+  "repository": { "type": "git", "url": "git+https://github.com/moshcoder/offtherecord.git" },
+  "bin": { "otr": "bin/otr" },
+  "engines": { "bun": ">=1.1" },
+  "scripts": {
+    "start": "bun src/server.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@profullstack/footer": "^0.2.6",
+    "hono": "^4.13.14"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^7.0.2"
+  }
+}
