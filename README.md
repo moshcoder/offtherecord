@@ -15,7 +15,7 @@ A long-form podcast: riotcoder, an AI host (an ElevenLabs agent), interviews Ant
 4. When the call ends, group.call saves the mp3. Every minute the server picks it up,
    levels it to -16 LUFS with ffmpeg, and writes a title and show notes from the
    speaker-labelled transcript (Gemini).
-5. It waits as `ready` until `otr publish <n>` (set `OTR_AUTOPUBLISH=1` to skip).
+5. It publishes itself as soon as it is ready (set `OTR_AUTOPUBLISH=0` to hold it as `ready` for `otr publish <n>`).
 
 ## Guests
 

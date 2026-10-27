@@ -8,8 +8,9 @@
  * 3. When the call ends group.call saves the mp3. `tick` finds it, downloads it,
  *    levels the loudness (ffmpeg, when there is one), and writes title and show
  *    notes from the room's speaker-labelled transcript.
- * 4. The episode waits as "ready" until it is published (OTR_AUTOPUBLISH=1 skips
- *    the wait): it is a recorded conversation, so a person hears it first.
+ * 4. The episode publishes itself as soon as it is ready (Anthony 2026-10-27:
+ *    "that should always happen automatically"); OTR_AUTOPUBLISH=0 holds it as
+ *    "ready" for `otr publish`.
  */
 import { mkdirSync, renameSync, unlinkSync } from 'node:fs'
 import type { Episode, Store } from './db.js'

@@ -260,7 +260,7 @@ export function serve() {
       ...(env.ELEVENLABS_API_KEY ? { elevenlabsKey: env.ELEVENLABS_API_KEY } : {}),
       ...(env.OTR_AGENT_ID ? { agentId: env.OTR_AGENT_ID } : {}),
       ...(env.GEMINI_API_KEY ? { geminiKey: env.GEMINI_API_KEY } : {}),
-      autopublish: env.OTR_AUTOPUBLISH === '1',
+      autopublish: env.OTR_AUTOPUBLISH !== '0',
       ffmpeg,
     },
   })
