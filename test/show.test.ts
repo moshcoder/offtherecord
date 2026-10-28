@@ -237,6 +237,18 @@ describe('the host opens the room and waits for callers', () => {
     expect(gc.calls.filter((c) => c.body?.sip).length).toBe(1)
   })
 
+  test('a host left alone after the callers hung up does not block opening the room again', async () => {
+    const { gc, store, show, req } = setup()
+    gc.setLive([{ kind: 'person', name: 'Anthony' }])
+    await show.start({ variant: 'deep', wait: true })
+    expect((await req('POST', '/api/v1/episodes', { open: true })).status).toBe(409)
+    gc.setLive([{ kind: 'agent', name: 'riotcoder (host)' }])
+    expect((await req('POST', '/api/v1/episodes', { open: true })).status).toBe(202)
+    expect(store.episode(1)!.status).toBe('saving')
+    expect(store.episode(2)!.status).toBe('live')
+    expect(store.episode(2)!.note).toBe('waiting for callers')
+  })
+
   test('nobody called in: the recording is not an episode', async () => {
     const { gc, store, show } = setup({ autopublish: true })
     await show.start({ open: true })
