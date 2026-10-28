@@ -28,6 +28,13 @@ export type Episode = {
   publishedAt: number | null
   /** Who was interviewed: a row in guests, or null for Anthony (the show's default guest). */
   guestId: number | null
+  /** Recovery (0.3.0): host redials and guest re-rings so far, and when each last went out. Kept here so a restart does not reset them. */
+  hostRedials: number
+  guestRings: number
+  lastDialAt: number
+  lastRingAt: number
+  /** The guest's phone was rung for this episode (not a dial-in or an opened room), so a dropped guest can be rung back. */
+  rang: boolean
 }
 
 export type GuestStatus = 'new' | 'booked' | 'recorded' | 'declined'
@@ -100,12 +107,14 @@ export class Store {
       );
     `)
     // Added after episode 1 shipped.
-    if (!(this.db.query('PRAGMA table_info(episodes)').all() as any[]).some((c) => c.name === 'guest_id')) this.db.exec('ALTER TABLE episodes ADD COLUMN guest_id INTEGER')
+    const has = (this.db.query('PRAGMA table_info(episodes)').all() as any[]).map((c) => c.name as string)
+    if (!has.includes('guest_id')) this.db.exec('ALTER TABLE episodes ADD COLUMN guest_id INTEGER')
+    for (const col of ['host_redials', 'guest_rings', 'last_dial_at', 'last_ring_at', 'rang']) if (!has.includes(col)) this.db.exec(`ALTER TABLE episodes ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`)
   }
 
   private toEpisode(r: any): Episode | null {
     return r
-      ? { n: r.n, title: r.title, topic: r.topic, variant: r.variant, status: r.status, room: r.room, recordingId: r.recording_id, audioPath: r.audio_path, audioBytes: r.audio_bytes, durationSecs: r.duration_secs, notes: r.notes, transcript: r.transcript, note: r.note, createdAt: r.created_at, hostJoinedAt: r.host_joined_at, endedAt: r.ended_at, publishedAt: r.published_at, guestId: r.guest_id ?? null }
+      ? { n: r.n, title: r.title, topic: r.topic, variant: r.variant, status: r.status, room: r.room, recordingId: r.recording_id, audioPath: r.audio_path, audioBytes: r.audio_bytes, durationSecs: r.duration_secs, notes: r.notes, transcript: r.transcript, note: r.note, createdAt: r.created_at, hostJoinedAt: r.host_joined_at, endedAt: r.ended_at, publishedAt: r.published_at, guestId: r.guest_id ?? null, hostRedials: r.host_redials ?? 0, guestRings: r.guest_rings ?? 0, lastDialAt: r.last_dial_at ?? 0, lastRingAt: r.last_ring_at ?? 0, rang: !!r.rang }
       : null
   }
 
@@ -128,9 +137,9 @@ export class Store {
   }
 
   update(n: number, patch: Partial<Omit<Episode, 'n' | 'createdAt'>>): Episode {
-    const cols: Record<string, string> = { title: 'title', topic: 'topic', variant: 'variant', status: 'status', room: 'room', recordingId: 'recording_id', audioPath: 'audio_path', audioBytes: 'audio_bytes', durationSecs: 'duration_secs', notes: 'notes', transcript: 'transcript', note: 'note', hostJoinedAt: 'host_joined_at', endedAt: 'ended_at', publishedAt: 'published_at' }
+    const cols: Record<string, string> = { title: 'title', topic: 'topic', variant: 'variant', status: 'status', room: 'room', recordingId: 'recording_id', audioPath: 'audio_path', audioBytes: 'audio_bytes', durationSecs: 'duration_secs', notes: 'notes', transcript: 'transcript', note: 'note', hostJoinedAt: 'host_joined_at', endedAt: 'ended_at', publishedAt: 'published_at', hostRedials: 'host_redials', guestRings: 'guest_rings', lastDialAt: 'last_dial_at', lastRingAt: 'last_ring_at', rang: 'rang' }
     const keys = Object.keys(patch).filter((k) => k in cols)
-    if (keys.length) this.db.query(`UPDATE episodes SET ${keys.map((k) => `${cols[k]} = ?`).join(', ')} WHERE n = ?`).run(...keys.map((k) => (patch as any)[k] ?? null), n)
+    if (keys.length) this.db.query(`UPDATE episodes SET ${keys.map((k) => `${cols[k]} = ?`).join(', ')} WHERE n = ?`).run(...keys.map((k) => { const v = (patch as any)[k]; return typeof v === 'boolean' ? Number(v) : v ?? null }), n)
     return this.episode(n)!
   }
 

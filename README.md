@@ -17,6 +17,20 @@ A long-form podcast: riotcoder, an AI host (an ElevenLabs agent), interviews Ant
    speaker-labelled transcript (Gemini).
 5. It publishes itself as soon as it is ready (set `OTR_AUTOPUBLISH=0` to hold it as `ready` for `otr publish <n>`).
 
+## Drops and errors
+
+Nothing needs a manual restart. Every 5 seconds the server checks the live room:
+
+- **Host dropped**, guest still on: the host is dialled back in, up to 3 times, 30 s apart.
+- **Guest dropped** (host waiting, or both gone): the guest is rung back, up to 3 times, a
+  minute apart. An unanswered first ring is rung again the same way.
+- **Host signed off** (`end_call`, read from the ElevenLabs conversation): no redial, no re-ring.
+- **group.call errors** on start, ring or host dial are retried 3 times, 10 s apart.
+- A ring left behind by a restart is picked back up; the counters live in the database.
+- Out of tries, the episode is **abandoned**: what was recorded is kept (split recordings
+  are joined in order) and held as `ready`, never autopublished, and `OTR_NOTIFY_CMD` (a
+  shell command, the message on stdin) tells the operator.
+
 ## Guests
 
 Anyone can sign up at **/guest** (free): name, phone, who they are, a topic, a link, and

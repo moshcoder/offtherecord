@@ -262,6 +262,8 @@ export function serve() {
       ...(env.GEMINI_API_KEY ? { geminiKey: env.GEMINI_API_KEY } : {}),
       autopublish: env.OTR_AUTOPUBLISH !== '0',
       ffmpeg,
+      // An abandoned or failed episode is told to the operator: the message on stdin of this command.
+      ...(env.OTR_NOTIFY_CMD ? { notify: (message: string) => void Bun.spawn(['sh', '-c', env.OTR_NOTIFY_CMD!], { stdin: new Blob([message]), stdout: 'ignore', stderr: 'inherit' }).exited } : {}),
     },
   })
   // Finished recordings are picked up every minute; a restart mid-call loses nothing.
