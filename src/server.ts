@@ -266,6 +266,8 @@ export function serve() {
   })
   // Finished recordings are picked up every minute; a restart mid-call loses nothing.
   setInterval(() => void show.tick(), 60_000)
+  // Someone dialled the show's room on their own: bring the host in.
+  setInterval(() => void show.door().catch((e) => console.log(`otr: door: ${e instanceof Error ? e.message : e}`)), 5_000)
   startRingRefresh()
   startPitFooterRefresh(SELF)
   startRingFooterRefresh()

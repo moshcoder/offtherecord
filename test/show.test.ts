@@ -10,6 +10,7 @@ function groupcall() {
   const calls: { method: string; path: string; body: any }[] = []
   let live: { kind: string; name: string }[] = []
   let recordings: any[] = []
+  let roomsList: { code: string; name: string }[] = []
   const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const u = new URL(String(url))
     const method = init?.method ?? 'GET'
@@ -17,7 +18,7 @@ function groupcall() {
     calls.push({ method, path: u.pathname, body })
     const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status })
     if (u.pathname === '/api/v1/rooms' && method === 'POST') return json({ code: '4821' }, 201)
-    if (u.pathname === '/api/v1/rooms' && method === 'GET') return json({ rooms: [] })
+    if (u.pathname === '/api/v1/rooms' && method === 'GET') return json({ rooms: roomsList })
     if (u.pathname === '/api/v1/rooms/4821' && method === 'GET') return json({ code: '4821', live })
     if (u.pathname.endsWith('/record')) return json({ record: true, recording: false })
     if (u.pathname.endsWith('/call')) return json({ ringing: true }, 202)
@@ -26,7 +27,7 @@ function groupcall() {
     if (u.pathname === '/api/v1/recordings/rec_1.mp3') return new Response(MP3)
     return json({ error: 'not found' }, 404)
   }) as unknown as typeof globalThis.fetch
-  return { calls, fetch, setLive: (l: typeof live) => (live = l), setRecordings: (r: any[]) => (recordings = r) }
+  return { calls, fetch, setLive: (l: typeof live) => (live = l), setRecordings: (r: any[]) => (recordings = r), setRoomsList: (r: typeof roomsList) => (roomsList = r) }
 }
 
 function setup(extra: Record<string, unknown> = {}) {
@@ -188,4 +189,22 @@ test('autopublish holds a call that never got going, and publishes a real one', 
     await show.tick()
     expect(store.episode(1)!.status).toBe(published ? 'published' : 'ready')
   }
+})
+
+describe('someone dials the room themselves', () => {
+  test('the host is dialled in within a tick, nobody is rung, and only once', async () => {
+    const { gc, store, show } = setup()
+    gc.setRoomsList([{ code: '4821', name: 'Off The Record' }])
+    await show.door()
+    expect(store.episodes().length).toBe(0)
+    gc.setLive([{ kind: 'person', name: 'a caller' }])
+    await show.door()
+    expect(store.episode(1)!.status).toBe('live')
+    expect(gc.calls.some((c) => c.body?.phone)).toBe(false)
+    expect(gc.calls.filter((c) => c.body?.sip).length).toBe(1)
+    expect(gc.calls.some((c) => c.path === '/api/v1/rooms/4821/record')).toBe(true)
+    gc.setLive([{ kind: 'person', name: 'a caller' }, { kind: 'agent', name: 'riotcoder (host)' }])
+    await show.door()
+    expect(gc.calls.filter((c) => c.body?.sip).length).toBe(1)
+  })
 })
