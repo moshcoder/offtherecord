@@ -4,6 +4,8 @@
  *
  *   otr record [--topic "..."] [--variant riff|deep|sprint|marathon] [--guest <id>]
  *       ring Anthony (or a signed-up guest) into a recorded room; the host dials in on pickup
+ *   otr open [--topic "..."] [--variant ...]
+ *       put the host in the room first, holding it 20 min for anyone who dials in
  *   otr guests                   sign-ups from /guest, newest first
  *   otr guest <id> decline|new   mark a sign-up
  *   otr episodes                 every episode and its state
@@ -35,6 +37,11 @@ try {
     case 'record': {
       const e = await call('POST', '/api/v1/episodes', { ...(flag('topic') ? { topic: flag('topic') } : {}), ...(flag('variant') ? { variant: flag('variant') } : {}), ...(flag('guest') ? { guest: Number(flag('guest')) } : {}) })
       console.log(`episode ${e.n} (${e.variant}): ringing ${e.guest ? `guest #${e.guest}` : 'Anthony'} into group.call room ${e.room}. Press 1 to join; the host dials in after.`)
+      break
+    }
+    case 'open': {
+      const e = await call('POST', '/api/v1/episodes', { open: true, ...(flag('topic') ? { topic: flag('topic') } : {}), ...(flag('variant') ? { variant: flag('variant') } : {}) })
+      console.log(`episode ${e.n} (${e.variant}): the host is in room ${e.room}, holding it 20 min. Dial 510-616-9327, code ${e.room}#.`)
       break
     }
     case 'guests':
@@ -73,7 +80,7 @@ try {
       console.log(await call('POST', '/api/v1/host/sync'))
       break
     default:
-      console.log((await Bun.file(import.meta.path).text()).split('\n').slice(2, 18).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
+      console.log((await Bun.file(import.meta.path).text()).split('\n').slice(2, 20).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
   }
 } catch (e) {
   console.error(`otr: ${e instanceof Error ? e.message : e}`)

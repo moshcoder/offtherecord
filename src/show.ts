@@ -20,6 +20,16 @@ import { FIRST_MESSAGE, hostPrompt, pickTopic, pickVariant, variant } from './va
 /** Shorter than this, a finished episode waits for `otr publish` instead of going out on its own. */
 export const MIN_AUTOPUBLISH_SECS = 8 * 60
 
+/**
+ * How long the host holds an opened room for callers before hanging up (Anthony
+ * 2026-10-28: "the host should be there first ... host should wait 20 minutes for
+ * call ins"). group.call cannot hang one leg up, so the host's own ElevenLabs
+ * silence timeout does it: twenty minutes with nobody speaking ends its call.
+ */
+export const WAIT_MINUTES = 20
+/** The note on an opened episode until its first caller arrives. */
+const WAITING = 'waiting for callers'
+
 export type Config = {
   origin: string
   audioDir: string
@@ -94,7 +104,7 @@ export class Show {
    * Start an episode: make the room, ring the guest. The host is dialled in by
    * `bringHost` once the guest is on the line (awaited here only in tests).
    */
-  async start(opts: { topic?: string; variant?: string; guest?: number; wait?: boolean; dialIn?: boolean } = {}): Promise<Episode> {
+  async start(opts: { topic?: string; variant?: string; guest?: number; wait?: boolean; dialIn?: boolean; open?: boolean } = {}): Promise<Episode> {
     if (this.store.inStatus('calling', 'live').length) throw new ShowError('An episode is already being recorded.', 409)
     const guest = opts.guest ? this.store.guest(opts.guest) : null
     if (opts.guest && !guest) throw new ShowError('No such guest.', 404)
@@ -108,7 +118,12 @@ export class Show {
       const room = rooms.find((r) => r.name === ROOM_NAME) ?? (await this.gc<{ code: string }>('POST', '/api/v1/rooms', { name: ROOM_NAME }))
       this.store.update(ep.n, { room: room.code })
       await this.gc('POST', `/api/v1/rooms/${room.code}/record`, { on: true })
-      if (opts.dialIn) {
+      if (opts.open) {
+        await this.dialHost(ep.n, true)
+        this.store.update(ep.n, { status: 'live', note: WAITING })
+        this.log(`episode ${ep.n} (${v}): host is holding room ${room.code} open for ${WAIT_MINUTES} min`)
+        return this.store.episode(ep.n)!
+      } else if (opts.dialIn) {
         this.log(`episode ${ep.n} (${v}): someone dialled into room ${room.code}`)
       } else {
         await this.gc('POST', `/api/v1/rooms/${room.code}/call`, { phone: guest?.phone ?? this.config.guestPhone, name: guest?.name ?? this.config.guestName })
@@ -132,6 +147,8 @@ export class Show {
    * alone burning agent minutes.
    */
   async door(): Promise<void> {
+    const waiting = this.store.inStatus('live').find((e) => e.note === WAITING)
+    if (waiting) return this.arrived(waiting)
     if (this.opening || this.store.inStatus('calling', 'live').length) return
     this.opening = true
     try {
@@ -154,6 +171,14 @@ export class Show {
   }
   private roomCode?: string
 
+  /** An opened room's first caller is on: the episode's clock starts now. */
+  private async arrived(ep: Episode): Promise<void> {
+    const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`)
+    if (!(room.live ?? []).some((p) => p.kind === 'person')) return
+    this.store.update(ep.n, { hostJoinedAt: Date.now(), note: '' })
+    this.log(`episode ${ep.n}: first caller is on`)
+  }
+
   /** Wait for the guest to be on the line, then dial the host in. */
   async bringHost(n: number): Promise<void> {
     const ep = this.store.episode(n)!
@@ -161,20 +186,7 @@ export class Show {
     while (Date.now() < until) {
       const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`).catch(() => null)
       if (room?.live?.some((p) => p.kind === 'person')) {
-        const v = variant(ep.variant)
-        const guest = ep.guestId ? this.store.guest(ep.guestId) : null
-        await this.gc('POST', `/api/v1/rooms/${ep.room}/call`, {
-          sip: this.config.hostSip,
-          name: HOST_NAME,
-          headers: {
-            'X-Otr-Episode': String(ep.n),
-            'X-Otr-Style': v.key,
-            'X-Otr-Minutes': String(v.minutes),
-            'X-Otr-Topic': sipValue(ep.topic, 180),
-            'X-Otr-Guest': sipValue(guest?.name ?? DEFAULT_GUEST, 80) || 'our guest',
-            'X-Otr-About': guest ? sipValue([guest.about, guest.link].filter(Boolean).join(' '), 600) || 'nothing yet' : 'the show founder',
-          },
-        })
+        await this.dialHost(n, false)
         this.store.update(n, { status: 'live', hostJoinedAt: Date.now() })
         this.log(`episode ${n}: the guest is on; host dialled in`)
         return
@@ -184,6 +196,33 @@ export class Show {
     this.store.update(n, { status: 'missed', note: 'the guest did not pick up' })
     if (ep.guestId) this.store.setGuestStatus(ep.guestId, 'new')
     this.log(`episode ${n}: the guest did not pick up`)
+  }
+
+  /**
+   * Dial the host agent into the episode's room over SIP, told the episode in X-
+   * headers. `waiting`: nobody is on yet, so it greets the empty line briefly and
+   * keeps quiet until someone speaks.
+   */
+  private async dialHost(n: number, waiting: boolean): Promise<void> {
+    const ep = this.store.episode(n)!
+    const v = variant(ep.variant)
+    const guest = ep.guestId ? this.store.guest(ep.guestId) : null
+    const guestName = sipValue(guest?.name ?? DEFAULT_GUEST, 80) || 'our guest'
+    const topic = sipValue(ep.topic, 180)
+    await this.gc('POST', `/api/v1/rooms/${ep.room}/call`, {
+      sip: this.config.hostSip,
+      name: HOST_NAME,
+      headers: {
+        'X-Otr-Episode': String(ep.n),
+        'X-Otr-Style': v.key,
+        'X-Otr-Minutes': String(v.minutes),
+        'X-Otr-Topic': topic,
+        'X-Otr-Guest': guestName,
+        'X-Otr-About': guest ? sipValue([guest.about, guest.link].filter(Boolean).join(' '), 600) || 'nothing yet' : 'the show founder',
+        'X-Otr-Waiting': waiting ? 'yes' : 'no',
+        'X-Otr-Hello': sipValue(waiting ? `riotcoder here, holding the line for episode ${ep.n} of Off The Record. Say hello when you are on.` : `Hey ${guestName}, riotcoder here. We are recording episode ${ep.n} of Off The Record, on ${topic}. Quick word on the format first.`, 300),
+      },
+    })
   }
 
   /** For the host's check_clock tool: how far in, and whether to wrap up. */
@@ -226,6 +265,12 @@ export class Show {
     if (!ready) {
       if (mine.some((r) => r.status === 'failed') && !mine.some((r) => r.status === 'recording' || r.status === 'saving')) this.store.update(ep.n, { status: 'failed', note: 'group.call could not save the recording' })
       else if (ep.status === 'live' && mine.length && !mine.some((r) => r.status === 'recording')) this.store.update(ep.n, { status: 'saving' })
+      return
+    }
+    // An opened room nobody called into: twenty minutes of the host waiting, not an episode.
+    if (ep.note === WAITING) {
+      this.store.update(ep.n, { status: 'missed', recordingId: ready.id, endedAt: Date.now(), note: 'nobody called in' })
+      this.log(`episode ${ep.n}: nobody called in`)
       return
     }
     this.store.update(ep.n, { status: 'saving', recordingId: ready.id, endedAt: Date.now() })
@@ -330,7 +375,7 @@ ${transcript.slice(0, 120_000)}`
   async syncHost(): Promise<{ agent_id: string }> {
     const { elevenlabsKey: key, agentId } = this.config
     if (!key || !agentId) throw new ShowError('ELEVENLABS_API_KEY and OTR_AGENT_ID are needed.', 503)
-    const placeholders = { sip_otr_episode: '0', sip_otr_style: 'riff', sip_otr_minutes: '60', sip_otr_topic: 'building with AI agents', sip_otr_guest: DEFAULT_GUEST, sip_otr_about: 'the show founder' }
+    const placeholders = { sip_otr_waiting: 'no', sip_otr_hello: 'riotcoder here, welcome to Off The Record.', sip_otr_episode: '0', sip_otr_style: 'riff', sip_otr_minutes: '60', sip_otr_topic: 'building with AI agents', sip_otr_guest: DEFAULT_GUEST, sip_otr_about: 'the show founder' }
     const body = {
       name: 'Off The Record host',
       conversation_config: {
@@ -346,6 +391,7 @@ ${transcript.slice(0, 120_000)}`
             // one here would delete end_call, and the host could never hang up.
             tools: [
               { type: 'system', name: 'end_call', description: 'End the call once the episode is signed off, or when the guest asks to stop.', params: { system_tool_type: 'end_call' } },
+              { type: 'system', name: 'skip_turn', description: 'Stay silent this turn: use it while holding an empty line for callers.', params: { system_tool_type: 'skip_turn' } },
               {
                 type: 'webhook',
                 name: 'check_clock',
@@ -362,7 +408,8 @@ ${transcript.slice(0, 120_000)}`
           },
         },
         tts: { voice_id: 'iP95p4xoKVk53GoZ742B', model_id: 'eleven_flash_v2' },
-        turn: { turn_timeout: 20, silence_end_call_timeout: 300 },
+        // Silence ends the call: long enough to hold an opened room for callers.
+        turn: { turn_timeout: 20, silence_end_call_timeout: WAIT_MINUTES * 60 },
         // ElevenLabs' ceiling, and the show's: two hours.
         conversation: { max_duration_seconds: 7200 },
       },
