@@ -105,6 +105,7 @@ export class Show {
    * `bringHost` once the guest is on the line (awaited here only in tests).
    */
   async start(opts: { topic?: string; variant?: string; guest?: number; wait?: boolean; dialIn?: boolean; open?: boolean } = {}): Promise<Episode> {
+    await this.closeStale()
     if (this.store.inStatus('calling', 'live').length) throw new ShowError('An episode is already being recorded.', 409)
     const guest = opts.guest ? this.store.guest(opts.guest) : null
     if (opts.guest && !guest) throw new ShowError('No such guest.', 404)
@@ -138,6 +139,24 @@ export class Show {
     if (opts.wait) await host
     else void host.catch((e) => this.log(`episode ${ep.n}: ${e}`))
     return this.store.episode(ep.n)!
+  }
+
+  /**
+   * A live episode whose callers have all gone is over, even if the host's leg is
+   * still in the room: a host that freezes on the ElevenLabs side stays connected
+   * and silent until its 20-minute silence timeout (episode 6, 2026-10-28: Anthony
+   * hung up at 10:40 and `otr open` refused with 409 until the stuck leg was hung
+   * up by hand at 10:42). An opened room still waiting for its first caller is not
+   * stale. The recording finishes through `tick` as usual.
+   */
+  private async closeStale(): Promise<void> {
+    for (const ep of this.store.inStatus('live')) {
+      if (ep.note === WAITING || !ep.room) continue
+      const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`).catch(() => null)
+      if (!room || (room.live ?? []).some((p) => p.kind === 'person')) continue
+      this.store.update(ep.n, { status: 'saving', note: 'the callers left' })
+      this.log(`episode ${ep.n}: nobody but the host is left in room ${ep.room}; closed it`)
+    }
   }
 
   /**
