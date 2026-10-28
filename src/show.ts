@@ -34,6 +34,21 @@ export const WAIT_MINUTES = 20
  */
 export const MAX_REDIALS = 3
 export const REDIAL_GAP_MS = 30_000
+/**
+ * A guest whose line drops mid-episode (the host still in the room, or both gone
+ * without the host signing off) is rung back, up to three times, a minute apart;
+ * so is one who does not pick up the first ring. After that the episode is
+ * abandoned: what was recorded is kept, held for a person, and the operator is
+ * told (Anthony 2026-10-28: "make sure you have error/dropped recovery too ...
+ * last time we had to manually restart. do that 3 times before you abandon").
+ */
+export const MAX_RINGS = 3
+export const RING_GAP_MS = 60_000
+/** A failed group.call request (start, ring, host dial) is tried this many more times. */
+export const RETRIES = 3
+/** A recording shorter than this is a stub from a dropped line, not part of the episode. */
+const MIN_PART_SECS = 30
+const ABANDONED = 'abandoned'
 /** The note on an opened episode until its first caller arrives. */
 const WAITING = 'waiting for callers'
 
@@ -58,6 +73,10 @@ export type Config = {
   /** How long to wait for the guest to pick up and press 1. */
   answerTimeoutMs?: number
   log?: (line: string) => void
+  /** Tell the operator something went wrong for good (an episode abandoned or failed). */
+  notify?: (message: string) => void
+  /** Wait between retries of a failed request; 10 s by default. */
+  retryGapMs?: number
 }
 
 export class ShowError extends Error {
@@ -92,6 +111,28 @@ export class Show {
     ;(this.config.log ?? console.log)(`otr: ${line}`)
   }
 
+  private tell(message: string): void {
+    this.log(message)
+    try {
+      this.config.notify?.(`Off The Record: ${message}`)
+    } catch (e) {
+      this.log(`notify failed: ${e}`)
+    }
+  }
+
+  /** Try a group.call request again, RETRIES times, when it fails on their side (or the network's). */
+  private async retry<T>(what: string, fn: () => Promise<T>): Promise<T> {
+    for (let i = 0; ; i++) {
+      try {
+        return await fn()
+      } catch (e) {
+        if ((e instanceof ShowError && e.status < 500) || i >= RETRIES) throw e
+        this.log(`${what} failed (${e instanceof Error ? e.message : e}); retry ${i + 1}/${RETRIES}`)
+        await new Promise((ok) => setTimeout(ok, this.config.retryGapMs ?? 10_000))
+      }
+    }
+  }
+
   /** group.call's API, as the show's operator account. */
   private async gc<T>(method: string, path: string, body?: unknown): Promise<T> {
     const res = await this.fetch(this.config.groupcallUrl.replace(/\/+$/, '') + path, {
@@ -122,30 +163,43 @@ export class Show {
     const ep = this.store.addEpisode({ topic, variant: v, guestId: guest?.id ?? null })
     try {
       // One room for the show (an account has only a few); recordings are told apart by when they started.
-      const { rooms } = await this.gc<{ rooms: { code: string; name: string }[] }>('GET', '/api/v1/rooms')
-      const room = rooms.find((r) => r.name === ROOM_NAME) ?? (await this.gc<{ code: string }>('POST', '/api/v1/rooms', { name: ROOM_NAME }))
+      const room = await this.retry('finding the room', async () => {
+        const { rooms } = await this.gc<{ rooms: { code: string; name: string }[] }>('GET', '/api/v1/rooms')
+        return rooms.find((r) => r.name === ROOM_NAME) ?? (await this.gc<{ code: string }>('POST', '/api/v1/rooms', { name: ROOM_NAME }))
+      })
       this.store.update(ep.n, { room: room.code })
-      await this.gc('POST', `/api/v1/rooms/${room.code}/record`, { on: true })
+      await this.retry('turning recording on', () => this.gc('POST', `/api/v1/rooms/${room.code}/record`, { on: true }))
       if (opts.open) {
-        await this.dialHost(ep.n, 'waiting')
+        await this.retry('dialling the host', () => this.dialHost(ep.n, 'waiting'))
         this.store.update(ep.n, { status: 'live', note: WAITING })
         this.log(`episode ${ep.n} (${v}): host is holding room ${room.code} open for ${WAIT_MINUTES} min`)
         return this.store.episode(ep.n)!
       } else if (opts.dialIn) {
         this.log(`episode ${ep.n} (${v}): someone dialled into room ${room.code}`)
       } else {
-        await this.gc('POST', `/api/v1/rooms/${room.code}/call`, { phone: guest?.phone ?? this.config.guestPhone, name: guest?.name ?? this.config.guestName })
+        await this.retry('ringing the guest', () => this.ringGuest(ep.n))
+        this.store.update(ep.n, { rang: true })
         if (guest) this.store.setGuestStatus(guest.id, 'booked')
         this.log(`episode ${ep.n} (${v}): ringing the guest into room ${room.code}`)
       }
     } catch (e) {
-      this.store.update(ep.n, { status: 'failed', note: e instanceof Error ? e.message : String(e) })
+      const why = e instanceof Error ? e.message : String(e)
+      this.store.update(ep.n, { status: 'failed', note: why })
+      this.tell(`episode ${ep.n} could not start after ${RETRIES} retries: ${why}`)
       throw e
     }
     const host = this.bringHost(ep.n)
     if (opts.wait) await host
     else void host.catch((e) => this.log(`episode ${ep.n}: ${e}`))
     return this.store.episode(ep.n)!
+  }
+
+  /** Ring the episode's guest (a signed-up guest's phone, or Anthony's). */
+  private async ringGuest(n: number): Promise<void> {
+    this.store.update(n, { lastRingAt: Date.now() })
+    const ep = this.store.episode(n)!
+    const guest = ep.guestId ? this.store.guest(ep.guestId) : null
+    await this.gc('POST', `/api/v1/rooms/${ep.room}/call`, { phone: guest?.phone ?? this.config.guestPhone, name: guest?.name ?? this.config.guestName })
   }
 
   /**
@@ -176,7 +230,10 @@ export class Show {
     const waiting = this.store.inStatus('live').find((e) => e.note === WAITING)
     if (waiting) return this.arrived(waiting)
     const live = this.store.inStatus('live')[0]
-    if (live) return this.redial(live)
+    if (live) return this.recover(live)
+    // A ring whose watcher died with the process (a restart mid-ring): pick it back up.
+    const calling = this.store.inStatus('calling').find((e) => !this.bringing.has(e.n) && e.room && Date.now() - e.createdAt > 10_000)
+    if (calling) return void this.bringHost(calling.n).catch((e) => this.log(`episode ${calling.n}: ${e}`))
     if (this.opening || this.store.inStatus('calling', 'live').length) return
     this.opening = true
     try {
@@ -207,40 +264,135 @@ export class Show {
     this.log(`episode ${ep.n}: first caller is on`)
   }
 
-  /** The host's leg is gone but a caller is still on: dial it back in (see MAX_REDIALS). */
-  private async redial(ep: Episode): Promise<void> {
-    if (!ep.room || !ep.hostJoinedAt) return
+  /**
+   * A live episode lost someone before its time was up: bring them back.
+   * - the host dropped, a caller is still on: dial the host in again (MAX_REDIALS,
+   *   REDIAL_GAP_MS apart);
+   * - the guest dropped (the host waiting in the room, or both gone): ring the
+   *   guest again (MAX_RINGS, RING_GAP_MS apart), if this episode rang them;
+   * unless the host signed off with end_call: then the show is over and the rest
+   * just hang up (episode 4, 2026-10-28: the host signed off at 47 min of a 60-min
+   * riff with Anthony still on, and the old redial tried to dial it back 3 times).
+   * Out of tries, the episode is abandoned: kept, held, and the operator is told.
+   */
+  private async recover(ep: Episode): Promise<void> {
+    if (!ep.room || !ep.hostJoinedAt || ep.note.startsWith(ABANDONED)) return
     // Past the format's length the host hung up on purpose.
     if (Date.now() - ep.hostJoinedAt >= variant(ep.variant).minutes * 60_000) return
     const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`)
     const live = room.live ?? []
-    if (!live.some((p) => p.kind === 'person') || live.some((p) => p.name === HOST_NAME)) return
-    const tries = this.redials.get(ep.n) ?? 0
-    if (tries >= MAX_REDIALS || Date.now() - (this.dialedAt.get(ep.n) ?? 0) < REDIAL_GAP_MS) return
-    this.redials.set(ep.n, tries + 1)
-    await this.dialHost(ep.n, 'rejoin')
-    this.log(`episode ${ep.n}: the host dropped with a caller still on; redialled (${tries + 1}/${MAX_REDIALS})`)
+    const caller = live.some((p) => p.kind === 'person')
+    const host = live.some((p) => p.name === HOST_NAME)
+    if (caller && host) {
+      this.missing.delete(ep.n)
+      return
+    }
+    if (!caller && !ep.rang) return // a dial-in: nobody to ring back
+    const now = Date.now()
+    if (caller) {
+      if (now - ep.lastDialAt < REDIAL_GAP_MS) return
+    } else if (now - ep.lastRingAt < RING_GAP_MS) return
+    // The host gone: was that a goodbye? (With the host still in the room, it was not.)
+    if (!host) {
+      const off = await this.hostSignedOff(ep)
+      if (off === 'yes') return
+      // ElevenLabs has not closed the host's conversation yet: give it a minute to say why it ended.
+      if (!this.missing.has(ep.n)) this.missing.set(ep.n, now)
+      if (off === 'pending' && now - this.missing.get(ep.n)! < 60_000) return
+      if (off === 'unknown' && !caller) return // cannot tell a drop from a goodbye: leave it
+    }
+    if (caller) {
+      if (ep.hostRedials >= MAX_REDIALS) return this.abandon(ep, `the host dropped and did not come back after ${MAX_REDIALS} redials`)
+      this.store.update(ep.n, { hostRedials: ep.hostRedials + 1 })
+      try {
+        await this.dialHost(ep.n, 'rejoin')
+        this.log(`episode ${ep.n}: the host dropped with a caller still on; redialled (${ep.hostRedials + 1}/${MAX_REDIALS})`)
+      } catch (e) {
+        this.log(`episode ${ep.n}: host redial ${ep.hostRedials + 1}/${MAX_REDIALS} failed: ${e instanceof Error ? e.message : e}`)
+      }
+      return
+    }
+    if (ep.guestRings >= MAX_RINGS) return this.abandon(ep, `the guest dropped and did not pick up ${MAX_RINGS} rings back`)
+    this.store.update(ep.n, { guestRings: ep.guestRings + 1 })
+    try {
+      await this.ringGuest(ep.n)
+      this.log(`episode ${ep.n}: the guest dropped; ringing them back (${ep.guestRings + 1}/${MAX_RINGS})`)
+    } catch (e) {
+      this.log(`episode ${ep.n}: re-ring ${ep.guestRings + 1}/${MAX_RINGS} failed: ${e instanceof Error ? e.message : e}`)
+    }
   }
-  private redials = new Map<number, number>()
-  private dialedAt = new Map<number, number>()
+  /** When a leg first went missing with ElevenLabs still saying the call is on. */
+  private missing = new Map<number, number>()
+
+  /** Out of tries: keep what was recorded, hold it for a person, and say so. */
+  private abandon(ep: Episode, why: string): void {
+    this.store.update(ep.n, { status: 'saving', note: `${ABANDONED}: ${why}` })
+    this.tell(`episode ${ep.n} abandoned: ${why}. What was recorded is kept and held (not published).`)
+  }
+
+  /**
+   * Did the host end its last call on purpose (end_call), per ElevenLabs? 'pending'
+   * while its conversation is still open, 'unknown' without a key or an answer.
+   */
+  async hostSignedOff(ep: Episode): Promise<'yes' | 'no' | 'pending' | 'unknown'> {
+    const { elevenlabsKey: key, agentId } = this.config
+    if (!key || !agentId) return 'unknown'
+    try {
+      const res = await this.fetch(`https://api.elevenlabs.io/v1/convai/conversations?agent_id=${encodeURIComponent(agentId)}&page_size=5`, { headers: { 'xi-api-key': key }, signal: AbortSignal.timeout(10_000) })
+      if (!res.ok) return 'unknown'
+      const { conversations = [] } = (await res.json()) as { conversations?: { start_time_unix_secs: number; status: string; termination_reason?: string | null }[] }
+      const last = conversations.filter((c) => c.start_time_unix_secs * 1000 >= ep.createdAt - 60_000).sort((a, b) => b.start_time_unix_secs - a.start_time_unix_secs)[0]
+      if (!last) return 'no'
+      if (/end_call/i.test(last.termination_reason ?? '')) return 'yes'
+      return last.status === 'done' || last.status === 'failed' ? 'no' : 'pending'
+    } catch {
+      return 'unknown'
+    }
+  }
 
   /** Wait for the guest to be on the line, then dial the host in. */
   async bringHost(n: number): Promise<void> {
+    if (this.bringing.has(n)) return
+    this.bringing.add(n)
+    try {
+      await this.waitAndDial(n)
+    } finally {
+      this.bringing.delete(n)
+    }
+  }
+  private bringing = new Set<number>()
+
+  /** Unanswered rings are rung again (MAX_RINGS); a host dial that keeps failing is left to `recover`. */
+  private async waitAndDial(n: number): Promise<void> {
     const ep = this.store.episode(n)!
-    const until = Date.now() + (this.config.answerTimeoutMs ?? 120_000)
-    while (Date.now() < until) {
+    const wait = this.config.answerTimeoutMs ?? 120_000
+    let until = Date.now() + wait
+    for (;;) {
       const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`).catch(() => null)
       if (room?.live?.some((p) => p.kind === 'person')) {
-        await this.dialHost(n, 'start')
         this.store.update(n, { status: 'live', hostJoinedAt: Date.now() })
-        this.log(`episode ${n}: the guest is on; host dialled in`)
+        try {
+          await this.retry('dialling the host', () => this.dialHost(n, 'start'))
+          this.log(`episode ${n}: the guest is on; host dialled in`)
+        } catch (e) {
+          // Live with no host: `recover` keeps redialling it every 30 s.
+          this.log(`episode ${n}: the guest is on but the host could not be dialled (${e instanceof Error ? e.message : e}); recovery takes over`)
+        }
         return
       }
-      await new Promise((ok) => setTimeout(ok, 3000))
+      if (Date.now() >= until) {
+        const now = this.store.episode(n)!
+        if (!now.rang || now.guestRings >= MAX_RINGS) break
+        this.store.update(n, { guestRings: now.guestRings + 1 })
+        this.log(`episode ${n}: no answer; ringing again (${now.guestRings + 1}/${MAX_RINGS})`)
+        await this.ringGuest(n).catch((e) => this.log(`episode ${n}: ring failed: ${e instanceof Error ? e.message : e}`))
+        until = Date.now() + wait
+      }
+      await new Promise((ok) => setTimeout(ok, Math.min(3000, wait)))
     }
     this.store.update(n, { status: 'missed', note: 'the guest did not pick up' })
     if (ep.guestId) this.store.setGuestStatus(ep.guestId, 'new')
-    this.log(`episode ${n}: the guest did not pick up`)
+    this.tell(`episode ${n}: the guest did not pick up after ${MAX_RINGS + 1} rings; abandoned`)
   }
 
   /**
@@ -249,7 +401,7 @@ export class Show {
    * keeps quiet until someone speaks. `rejoin`: its leg dropped mid-episode.
    */
   private async dialHost(n: number, mode: 'start' | 'waiting' | 'rejoin'): Promise<void> {
-    this.dialedAt.set(n, Date.now())
+    this.store.update(n, { lastDialAt: Date.now() })
     const waiting = mode === 'waiting'
     const ep = this.store.episode(n)!
     const v = variant(ep.variant)
@@ -308,7 +460,12 @@ export class Show {
     // This episode's: started after it was, in the show's shared room. The longest
     // one, since a dropped and re-dialled call can leave a short stub first.
     const mine = recordings.filter((r) => Date.parse(r.started_at) >= ep.createdAt - 60_000 || !r.started_at)
-    const ready = mine.filter((r) => r.status === 'ready' && r.mp3).sort((a, b) => (b.duration_secs ?? 0) - (a.duration_secs ?? 0))[0]
+    // Still recording (a re-rung guest or a redialled host started a new part): not over yet.
+    if (mine.some((r) => r.status === 'recording')) return
+    // Everybody dropped before time and the guest is being rung back: wait for them.
+    if (ep.status === 'live' && (await this.mayRecover(ep))) return
+    const parts = mine.filter((r) => r.status === 'ready' && r.mp3).sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at))
+    const ready = parts.slice().sort((a, b) => (b.duration_secs ?? 0) - (a.duration_secs ?? 0))[0]
     if (!ready) {
       if (mine.some((r) => r.status === 'failed') && !mine.some((r) => r.status === 'recording' || r.status === 'saving')) this.store.update(ep.n, { status: 'failed', note: 'group.call could not save the recording' })
       else if (ep.status === 'live' && mine.length && !mine.some((r) => r.status === 'recording')) this.store.update(ep.n, { status: 'saving' })
@@ -321,11 +478,19 @@ export class Show {
       return
     }
     this.store.update(ep.n, { status: 'saving', recordingId: ready.id, endedAt: Date.now() })
-    const res = await this.fetch(ready.mp3!, { headers: { authorization: `Bearer ${this.config.groupcallKey}` } })
-    if (!res.ok) throw new Error(`mp3 download ${res.status}`)
     const raw = `${this.config.audioDir}/${ep.n}.raw.mp3`
     const out = `${this.config.audioDir}/${ep.n}.mp3`
-    await Bun.write(raw, await res.arrayBuffer())
+    // A call that dropped and was brought back is several recordings: join them in order.
+    const keep = parts.filter((r) => (r.duration_secs ?? MIN_PART_SECS) >= MIN_PART_SECS)
+    const files: string[] = []
+    for (const [i, r] of (keep.length > 1 && this.config.ffmpeg ? keep : [ready]).entries()) {
+      const res = await this.fetch(r.mp3!, { headers: { authorization: `Bearer ${this.config.groupcallKey}` } })
+      if (!res.ok) throw new Error(`mp3 download ${res.status}`)
+      const f = `${this.config.audioDir}/${ep.n}.part${i}.mp3`
+      await Bun.write(f, await res.arrayBuffer())
+      files.push(f)
+    }
+    await this.join(files, raw)
     await this.master(raw, out)
     const durationSecs = (await this.probe(out)) ?? ready.duration_secs
     const lines = await this.gc<{ lines: { who: string; text: string; at: string }[] }>('GET', `/api/v1/rooms/${ep.room}/transcript?limit=5000`).catch(() => ({ lines: [] }))
@@ -335,6 +500,10 @@ export class Show {
     if (ep.guestId) this.store.setGuestStatus(ep.guestId, 'recorded')
     this.log(`episode ${ep.n} is ready: ${title}`)
     if (!this.config.autopublish) return
+    if (ep.note.startsWith(ABANDONED)) {
+      this.log(`episode ${ep.n}: held, it was abandoned; publish by hand with otr publish ${ep.n}`)
+      return
+    }
     // A call that never got going (guest muted, line dead, host gave up) is a few
     // minutes of the host saying "still with me?": hold it for a person to look at.
     if ((durationSecs ?? 0) < MIN_AUTOPUBLISH_SECS) {
@@ -342,6 +511,22 @@ export class Show {
       return
     }
     this.publish(ep.n)
+  }
+
+  /** Could `recover` still bring the guest back? Only then is an empty room not the end. */
+  private async mayRecover(ep: Episode): Promise<boolean> {
+    if (!ep.rang || !ep.hostJoinedAt || ep.note.startsWith(ABANDONED) || ep.guestRings >= MAX_RINGS) return false
+    if (Date.now() - ep.hostJoinedAt >= variant(ep.variant).minutes * 60_000) return false
+    const off = await this.hostSignedOff(ep)
+    return off === 'no' || off === 'pending'
+  }
+
+  /** One file from the parts of a call, in order (ffmpeg concat); a single part is just renamed. */
+  private async join(files: string[], out: string): Promise<void> {
+    if (files.length === 1) return renameSync(files[0]!, out)
+    const p = Bun.spawn([this.config.ffmpeg!, '-hide_banner', '-loglevel', 'error', '-y', ...files.flatMap((f) => ['-i', f]), '-filter_complex', `${files.map((_, i) => `[${i}:a]`).join('')}concat=n=${files.length}:v=0:a=1[a]`, '-map', '[a]', out], { stderr: 'pipe' })
+    if ((await p.exited) !== 0) throw new Error(`ffmpeg concat failed: ${(await new Response(p.stderr).text()).slice(0, 200)}`)
+    for (const f of files) unlinkSync(f)
   }
 
   /**

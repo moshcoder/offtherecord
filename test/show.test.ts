@@ -11,8 +11,10 @@ function groupcall() {
   let live: { kind: string; name: string }[] = []
   let recordings: any[] = []
   let roomsList: { code: string; name: string }[] = []
+  let convos: { start_time_unix_secs: number; status: string; termination_reason?: string }[] | null = null
   const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const u = new URL(String(url))
+    if (u.hostname === 'api.elevenlabs.io' && convos) return new Response(JSON.stringify({ conversations: convos }))
     const method = init?.method ?? 'GET'
     const body = init?.body ? JSON.parse(String(init.body)) : undefined
     calls.push({ method, path: u.pathname, body })
@@ -27,7 +29,7 @@ function groupcall() {
     if (u.pathname === '/api/v1/recordings/rec_1.mp3') return new Response(MP3)
     return json({ error: 'not found' }, 404)
   }) as unknown as typeof globalThis.fetch
-  return { calls, fetch, setLive: (l: typeof live) => (live = l), setRecordings: (r: any[]) => (recordings = r), setRoomsList: (r: typeof roomsList) => (roomsList = r) }
+  return { calls, fetch, setLive: (l: typeof live) => (live = l), setRecordings: (r: any[]) => (recordings = r), setRoomsList: (r: typeof roomsList) => (roomsList = r), setConvos: (c: typeof convos) => (convos = c) }
 }
 
 function setup(extra: Record<string, unknown> = {}) {
@@ -38,7 +40,7 @@ function setup(extra: Record<string, unknown> = {}) {
     store,
     adminKey: 'admin',
     salt: 'salt',
-    config: { origin: 'https://otr.test', audioDir: dir, groupcallUrl: 'https://gc.test', groupcallKey: 'gc_x', guestPhone: '+14085550101', guestName: 'Anthony', hostSip: 'sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp', hostToolSecret: 'tool', fetch: gc.fetch, ffmpeg: null, answerTimeoutMs: 50, log: () => {}, ...extra },
+    config: { origin: 'https://otr.test', audioDir: dir, groupcallUrl: 'https://gc.test', groupcallKey: 'gc_x', guestPhone: '+14085550101', guestName: 'Anthony', hostSip: 'sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp', hostToolSecret: 'tool', fetch: gc.fetch, retryGapMs: 0, ffmpeg: null, answerTimeoutMs: 50, log: () => {}, ...extra },
   })
   const req = (method: string, path: string, body?: unknown, headers: Record<string, string> = {}) =>
     app.request(path, { method, headers: { authorization: 'Bearer admin', ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, ...(body ? { body: JSON.stringify(body) } : {}) })
@@ -305,5 +307,158 @@ describe('the host opens the room and waits for callers', () => {
     await show.tick()
     expect(store.episode(1)!.status).toBe('missed')
     expect(store.episode(1)!.note).toBe('nobody called in')
+  })
+})
+
+describe('error and drop recovery', () => {
+  const HOST = { kind: 'agent', name: 'riotcoder (host)' }
+  const ME = { kind: 'person', name: 'Anthony' }
+  const rings = (gc: ReturnType<typeof groupcall>) => gc.calls.filter((c) => c.body?.phone)
+  const hosts = (gc: ReturnType<typeof groupcall>) => gc.calls.filter((c) => c.body?.sip)
+  const keys = { elevenlabsKey: 'xi', agentId: 'agent_1' }
+
+  test('the guest drops with the host still on: rung back 3 times a minute apart, then abandoned and held', async () => {
+    const notes: string[] = []
+    const { gc, store, show } = setup({ ...keys, autopublish: true, notify: (m: string) => notes.push(m) })
+    const t0 = Date.now()
+    try {
+      setSystemTime(t0)
+      gc.setLive([ME])
+      await show.start({ variant: 'riff', wait: true })
+      expect(rings(gc).length).toBe(1)
+      gc.setLive([HOST])
+      await show.door()
+      expect(rings(gc).length).toBe(1) // the first ring was under a minute ago
+      for (let i = 1; i <= 3; i++) {
+        setSystemTime(t0 + i * 61_000)
+        await show.door()
+        await show.door()
+        expect(rings(gc).length).toBe(1 + i)
+      }
+      expect(store.episode(1)!.guestRings).toBe(3)
+      setSystemTime(t0 + 4 * 61_000)
+      await show.door()
+      expect(rings(gc).length).toBe(4)
+      const ep = store.episode(1)!
+      expect(ep.status).toBe('saving')
+      expect(ep.note).toContain('abandoned')
+      expect(notes.length).toBe(1)
+      expect(notes[0]).toContain('episode 1 abandoned')
+      // What was recorded is kept but not published, however long.
+      gc.setRecordings([{ id: 'rec_1', status: 'ready', mp3: 'https://gc.test/api/v1/recordings/rec_1.mp3', duration_secs: 1800, started_at: new Date(t0).toISOString() }])
+      await show.tick()
+      expect(store.episode(1)!.status).toBe('ready')
+    } finally {
+      setSystemTime()
+    }
+  })
+
+  test('the guest comes back on a re-ring: no more rings, the episode carries on', async () => {
+    const { gc, store, show } = setup(keys)
+    const t0 = Date.now()
+    try {
+      setSystemTime(t0)
+      gc.setLive([ME])
+      await show.start({ variant: 'riff', wait: true })
+      gc.setLive([HOST])
+      setSystemTime(t0 + 61_000)
+      await show.door()
+      expect(rings(gc).length).toBe(2)
+      gc.setLive([ME, HOST])
+      setSystemTime(t0 + 200_000)
+      await show.door()
+      expect(rings(gc).length).toBe(2)
+      expect(store.episode(1)!.status).toBe('live')
+    } finally {
+      setSystemTime()
+    }
+  })
+
+  test('both dropped and the host did not sign off: the recording waits while the guest is rung back', async () => {
+    const { gc, store, show } = setup(keys)
+    const t0 = Date.now()
+    try {
+      setSystemTime(t0)
+      gc.setLive([ME])
+      await show.start({ variant: 'riff', wait: true })
+      gc.setLive([])
+      gc.setConvos([{ start_time_unix_secs: Math.floor(t0 / 1000), status: 'done', termination_reason: 'Client disconnected' }])
+      gc.setRecordings([{ id: 'rec_1', status: 'ready', mp3: 'https://gc.test/api/v1/recordings/rec_1.mp3', duration_secs: 900, started_at: new Date(t0).toISOString() }])
+      setSystemTime(t0 + 61_000)
+      await show.tick()
+      expect(store.episode(1)!.status).toBe('live')
+      await show.door()
+      expect(rings(gc).length).toBe(2)
+    } finally {
+      setSystemTime()
+    }
+  })
+
+  test('the host signed off with end_call: no redial and no re-ring (episode 4)', async () => {
+    const { gc, store, show } = setup(keys)
+    const t0 = Date.now()
+    try {
+      setSystemTime(t0)
+      gc.setLive([ME])
+      await show.start({ variant: 'riff', wait: true })
+      gc.setConvos([{ start_time_unix_secs: Math.floor(t0 / 1000) + 5, status: 'done', termination_reason: 'end_call tool was called.' }])
+      setSystemTime(t0 + 47 * 60_000)
+      await show.door() // Anthony still on, host gone
+      gc.setLive([])
+      setSystemTime(t0 + 48 * 60_000)
+      await show.door()
+      expect(hosts(gc).length).toBe(1)
+      expect(rings(gc).length).toBe(1)
+      gc.setRecordings([{ id: 'rec_1', status: 'ready', mp3: 'https://gc.test/api/v1/recordings/rec_1.mp3', duration_secs: 2820, started_at: new Date(t0).toISOString() }])
+      await show.tick()
+      expect(store.episode(1)!.status).toBe('ready')
+    } finally {
+      setSystemTime()
+    }
+  })
+
+  test('an unanswered ring is rung again 3 times before the episode is missed', async () => {
+    const notes: string[] = []
+    const { gc, store, show } = setup({ notify: (m: string) => notes.push(m) })
+    await show.start({ variant: 'riff', wait: true })
+    expect(rings(gc).length).toBe(4)
+    expect(store.episode(1)!.status).toBe('missed')
+    expect(notes[0]).toContain('did not pick up after 4 rings')
+  })
+
+  test('a failing group.call request is retried 3 times before the episode fails', async () => {
+    const notes: string[] = []
+    const gc = groupcall()
+    let fails = 2
+    const flaky = (async (url: any, init?: RequestInit) => {
+      if (String(url).endsWith('/record') && fails-- > 0) return new Response(JSON.stringify({ error: 'upstream' }), { status: 503 })
+      return gc.fetch(url, init)
+    }) as typeof fetch
+    const { show, store } = setup({ fetch: flaky, notify: (m: string) => notes.push(m) })
+    gc.setLive([ME])
+    await show.start({ variant: 'riff', wait: true })
+    expect(store.episode(1)!.status).toBe('live')
+    fails = 99
+    gc.setLive([])
+    store.update(1, { status: 'saving' })
+    await expect(show.start({ variant: 'riff' })).rejects.toThrow('upstream')
+    expect(store.episode(2)!.status).toBe('failed')
+    expect(notes[0]).toContain('could not start after 3 retries')
+  })
+
+  test('a ring left behind by a restart is picked back up', async () => {
+    const { gc, store, show } = setup()
+    const t0 = Date.now()
+    try {
+      const ep = store.addEpisode({ topic: 'x', variant: 'riff' }, t0 - 60_000)
+      store.update(ep.n, { room: '4821', rang: true, lastRingAt: t0 - 60_000 })
+      gc.setLive([ME])
+      await show.door()
+      await new Promise((ok) => setTimeout(ok, 20))
+      expect(store.episode(1)!.status).toBe('live')
+      expect(hosts(gc).length).toBe(1)
+    } finally {
+      setSystemTime()
+    }
   })
 })
