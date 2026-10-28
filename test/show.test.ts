@@ -172,3 +172,9 @@ describe('guests', () => {
     expect((await app.request('/api/v1/guests')).status).toBe(401)
   })
 })
+
+test('host briefs the guest on the format before the cold open', async () => {
+  const { hostPrompt, FIRST_MESSAGE } = await import('../src/variants.ts')
+  expect(hostPrompt()).toContain('brief the guest on this episode\'s format')
+  expect(FIRST_MESSAGE).toContain('format')
+})
