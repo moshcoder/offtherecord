@@ -29,7 +29,7 @@ function groupcall() {
   return { calls, fetch, setLive: (l: typeof live) => (live = l), setRecordings: (r: any[]) => (recordings = r) }
 }
 
-function setup() {
+function setup(extra: Record<string, unknown> = {}) {
   const gc = groupcall()
   const store = new Store(':memory:')
   const dir = `${process.env.TMPDIR ?? '/tmp'}/otr-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -37,7 +37,7 @@ function setup() {
     store,
     adminKey: 'admin',
     salt: 'salt',
-    config: { origin: 'https://otr.test', audioDir: dir, groupcallUrl: 'https://gc.test', groupcallKey: 'gc_x', guestPhone: '+14085550101', guestName: 'Anthony', hostSip: 'sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp', hostToolSecret: 'tool', fetch: gc.fetch, ffmpeg: null, answerTimeoutMs: 50, log: () => {} },
+    config: { origin: 'https://otr.test', audioDir: dir, groupcallUrl: 'https://gc.test', groupcallKey: 'gc_x', guestPhone: '+14085550101', guestName: 'Anthony', hostSip: 'sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp', hostToolSecret: 'tool', fetch: gc.fetch, ffmpeg: null, answerTimeoutMs: 50, log: () => {}, ...extra },
   })
   const req = (method: string, path: string, body?: unknown, headers: Record<string, string> = {}) =>
     app.request(path, { method, headers: { authorization: 'Bearer admin', ...(body ? { 'content-type': 'application/json' } : {}), ...headers }, ...(body ? { body: JSON.stringify(body) } : {}) })
@@ -177,4 +177,15 @@ test('host briefs the guest on the format before the cold open', async () => {
   const { hostPrompt, FIRST_MESSAGE } = await import('../src/variants.ts')
   expect(hostPrompt()).toContain('brief the guest on this episode\'s format')
   expect(FIRST_MESSAGE).toContain('format')
+})
+
+test('autopublish holds a call that never got going, and publishes a real one', async () => {
+  for (const [secs, published] of [[240, false], [2100, true]] as const) {
+    const { gc, store, show } = setup({ autopublish: true })
+    gc.setLive([{ kind: 'person', name: 'Anthony' }])
+    await show.start({ topic: 'Moshpit', variant: 'sprint', wait: true })
+    gc.setRecordings([{ id: 'rec_1', status: 'ready', mp3: 'https://gc.test/api/v1/recordings/rec_1.mp3', duration_secs: secs, started_at: new Date().toISOString() }])
+    await show.tick()
+    expect(store.episode(1)!.status).toBe(published ? 'published' : 'ready')
+  }
 })

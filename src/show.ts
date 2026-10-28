@@ -16,6 +16,10 @@ import { mkdirSync, renameSync, unlinkSync } from 'node:fs'
 import type { Episode, Store } from './db.js'
 import { FIRST_MESSAGE, hostPrompt, pickTopic, pickVariant, variant } from './variants.js'
 
+
+/** Shorter than this, a finished episode waits for `otr publish` instead of going out on its own. */
+export const MIN_AUTOPUBLISH_SECS = 8 * 60
+
 export type Config = {
   origin: string
   audioDir: string
@@ -205,7 +209,14 @@ export class Show {
     this.store.update(ep.n, { status: 'ready', audioPath: out, audioBytes: Bun.file(out).size, durationSecs: durationSecs ?? null, transcript, title, notes })
     if (ep.guestId) this.store.setGuestStatus(ep.guestId, 'recorded')
     this.log(`episode ${ep.n} is ready: ${title}`)
-    if (this.config.autopublish) this.publish(ep.n)
+    if (!this.config.autopublish) return
+    // A call that never got going (guest muted, line dead, host gave up) is a few
+    // minutes of the host saying "still with me?": hold it for a person to look at.
+    if ((durationSecs ?? 0) < MIN_AUTOPUBLISH_SECS) {
+      this.log(`episode ${ep.n}: held, only ${Math.round((durationSecs ?? 0) / 60)} min; publish by hand with otr publish ${ep.n}`)
+      return
+    }
+    this.publish(ep.n)
   }
 
   /**
