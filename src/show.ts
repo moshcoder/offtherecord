@@ -94,7 +94,7 @@ export class Show {
    * Start an episode: make the room, ring the guest. The host is dialled in by
    * `bringHost` once the guest is on the line (awaited here only in tests).
    */
-  async start(opts: { topic?: string; variant?: string; guest?: number; wait?: boolean } = {}): Promise<Episode> {
+  async start(opts: { topic?: string; variant?: string; guest?: number; wait?: boolean; dialIn?: boolean } = {}): Promise<Episode> {
     if (this.store.inStatus('calling', 'live').length) throw new ShowError('An episode is already being recorded.', 409)
     const guest = opts.guest ? this.store.guest(opts.guest) : null
     if (opts.guest && !guest) throw new ShowError('No such guest.', 404)
@@ -108,9 +108,13 @@ export class Show {
       const room = rooms.find((r) => r.name === ROOM_NAME) ?? (await this.gc<{ code: string }>('POST', '/api/v1/rooms', { name: ROOM_NAME }))
       this.store.update(ep.n, { room: room.code })
       await this.gc('POST', `/api/v1/rooms/${room.code}/record`, { on: true })
-      await this.gc('POST', `/api/v1/rooms/${room.code}/call`, { phone: guest?.phone ?? this.config.guestPhone, name: guest?.name ?? this.config.guestName })
-      if (guest) this.store.setGuestStatus(guest.id, 'booked')
-      this.log(`episode ${ep.n} (${v}): ringing the guest into room ${room.code}`)
+      if (opts.dialIn) {
+        this.log(`episode ${ep.n} (${v}): someone dialled into room ${room.code}`)
+      } else {
+        await this.gc('POST', `/api/v1/rooms/${room.code}/call`, { phone: guest?.phone ?? this.config.guestPhone, name: guest?.name ?? this.config.guestName })
+        if (guest) this.store.setGuestStatus(guest.id, 'booked')
+        this.log(`episode ${ep.n} (${v}): ringing the guest into room ${room.code}`)
+      }
     } catch (e) {
       this.store.update(ep.n, { status: 'failed', note: e instanceof Error ? e.message : String(e) })
       throw e
@@ -120,6 +124,35 @@ export class Show {
     else void host.catch((e) => this.log(`episode ${ep.n}: ${e}`))
     return this.store.episode(ep.n)!
   }
+
+  /**
+   * Called every few seconds: anyone who dials the show's room themselves gets the
+   * host, no ring needed (Anthony 2026-10-28: "nobody in room ... the host should be
+   * there first"). The host joins seconds after the first person, so it never sits
+   * alone burning agent minutes.
+   */
+  async door(): Promise<void> {
+    if (this.opening || this.store.inStatus('calling', 'live').length) return
+    this.opening = true
+    try {
+      await this.openDoor()
+    } finally {
+      this.opening = false
+    }
+  }
+  private opening = false
+  private async openDoor(): Promise<void> {
+    if (!this.roomCode) {
+      const { rooms } = await this.gc<{ rooms: { code: string; name: string }[] }>('GET', '/api/v1/rooms')
+      this.roomCode = rooms.find((r) => r.name === ROOM_NAME)?.code
+      if (!this.roomCode) return
+    }
+    const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${this.roomCode}`)
+    const live = room.live ?? []
+    if (!live.some((p) => p.kind === 'person') || live.some((p) => p.name === HOST_NAME)) return
+    await this.start({ dialIn: true, wait: true })
+  }
+  private roomCode?: string
 
   /** Wait for the guest to be on the line, then dial the host in. */
   async bringHost(n: number): Promise<void> {
