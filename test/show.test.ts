@@ -62,7 +62,7 @@ describe('an episode, start to finish', () => {
     expect(paths.slice(0, 4)).toEqual(['GET /api/v1/rooms', 'POST /api/v1/rooms', 'POST /api/v1/rooms/4821/record', 'POST /api/v1/rooms/4821/call'])
     expect(gc.calls[3]!.body).toEqual({ phone: '+14085550101', name: 'Anthony' })
     const host = gc.calls.find((c) => c.body?.sip)!
-    expect(host.body.headers).toEqual({ 'X-Otr-Episode': '1', 'X-Otr-Style': 'deep', 'X-Otr-Minutes': '90', 'X-Otr-Topic': 'Moshpit', 'X-Otr-Guest': 'Anthony Ettinger', 'X-Otr-About': 'the show founder' })
+    expect(host.body.headers).toEqual({ 'X-Otr-Episode': '1', 'X-Otr-Style': 'deep', 'X-Otr-Minutes': '90', 'X-Otr-Topic': 'Moshpit', 'X-Otr-Guest': 'Anthony Ettinger', 'X-Otr-About': 'the show founder', 'X-Otr-Waiting': 'no', 'X-Otr-Hello': 'Hey Anthony Ettinger, riotcoder here. We are recording episode 1 of Off The Record, on Moshpit. Quick word on the format first.' })
     expect(store.episode(1)!.status).toBe('live')
 
     // A second episode cannot start over a live one.
@@ -177,7 +177,7 @@ describe('guests', () => {
 test('host briefs the guest on the format before the cold open', async () => {
   const { hostPrompt, FIRST_MESSAGE } = await import('../src/variants.ts')
   expect(hostPrompt()).toContain('brief the guest on this episode\'s format')
-  expect(FIRST_MESSAGE).toContain('format')
+  expect(FIRST_MESSAGE).toBe('{{sip_otr_hello}}')
 })
 
 test('autopublish holds a call that never got going, and publishes a real one', async () => {
@@ -206,5 +206,43 @@ describe('someone dials the room themselves', () => {
     gc.setLive([{ kind: 'person', name: 'a caller' }, { kind: 'agent', name: 'riotcoder (host)' }])
     await show.door()
     expect(gc.calls.filter((c) => c.body?.sip).length).toBe(1)
+  })
+})
+
+describe('the host opens the room and waits for callers', () => {
+  test('dials the host in first, rings nobody, starts the clock on the first caller', async () => {
+    const { gc, store, req } = setup()
+    const res = await req('POST', '/api/v1/episodes', { open: true })
+    expect(res.status).toBe(202)
+    expect(gc.calls.some((c) => c.body?.phone)).toBe(false)
+    const host = gc.calls.find((c) => c.body?.sip)!
+    expect(host.body.headers['X-Otr-Waiting']).toBe('yes')
+    expect(host.body.headers['X-Otr-Hello']).toContain('holding the line')
+    const ep = store.episode(1)!
+    expect(ep.status).toBe('live')
+    expect(ep.hostJoinedAt).toBeNull()
+    expect((await req('POST', '/api/v1/episodes', { open: true })).status).toBe(409)
+  })
+
+  test('the first caller starts the clock and no second host is dialled', async () => {
+    const { gc, store, show } = setup()
+    await show.start({ open: true })
+    gc.setLive([{ kind: 'agent', name: 'riotcoder (host)' }])
+    await show.door()
+    expect(store.episode(1)!.hostJoinedAt).toBeNull()
+    gc.setLive([{ kind: 'agent', name: 'riotcoder (host)' }, { kind: 'person', name: 'Anthony' }])
+    await show.door()
+    expect(store.episode(1)!.hostJoinedAt).not.toBeNull()
+    expect(store.episode(1)!.note).toBe('')
+    expect(gc.calls.filter((c) => c.body?.sip).length).toBe(1)
+  })
+
+  test('nobody called in: the recording is not an episode', async () => {
+    const { gc, store, show } = setup({ autopublish: true })
+    await show.start({ open: true })
+    gc.setRecordings([{ id: 'rec_1', status: 'ready', mp3: 'https://gc.test/api/v1/recordings/rec_1.mp3', duration_secs: 1200, started_at: new Date().toISOString() }])
+    await show.tick()
+    expect(store.episode(1)!.status).toBe('missed')
+    expect(store.episode(1)!.note).toBe('nobody called in')
   })
 })

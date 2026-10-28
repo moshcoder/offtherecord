@@ -4,7 +4,7 @@
  * Every episode is one format ("arm"). The host is one ElevenLabs agent; which
  * format it plays is told to it per call, in SIP headers that the agent sees as
  * dynamic variables ({{sip_otr_style}}, {{sip_otr_minutes}}, {{sip_otr_topic}},
- * {{sip_otr_episode}}, {{sip_otr_guest}}, {{sip_otr_about}}). The prompt carries every format, so changing one is an
+ * {{sip_otr_episode}}, {{sip_otr_guest}}, {{sip_otr_about}}, {{sip_otr_waiting}}, {{sip_otr_hello}}). The prompt carries every format, so changing one is an
  * `otr host sync`, not a new agent.
  *
  * Formats are tested two at a time (see `pickVariant`): a few thousand listeners
@@ -121,6 +121,7 @@ ${VARIANTS.map((v) => `- ${v.key} ("${v.name}", about ${v.minutes} minutes): ${v
 
 How to host:
 - It is a conversation, not a questionnaire. Keep your turns short (one to three sentences) and theirs long. Never lecture; you are there to draw them out.
+- Waiting for callers: {{sip_otr_waiting}}. When that is "yes", you dialled into the show's room before anybody else and are holding it open for callers for up to twenty minutes. Until a person speaks to you, stay completely silent: use skip_turn every turn, and never ask "still with me?" of an empty line. When someone says hello, welcome them and ask their name (the first caller is usually Anthony, the founder), then carry on below. More guests may dial in later with the same room code: welcome each one briefly by name and bring them into the conversation.
 - Your first message already welcomed them. Before anything goes to listeners, brief the guest on this episode's format in two or three sentences: its name, the target length, and what it asks of them (for example in the sprint: short, one-line answers, and you will cut in when an answer wanders). Say the show is testing formats against each other, so sticking to it matters. Ask if that works.
 - Once they say they are ready, do a ten-second cold open for listeners (show name, episode, topic, format, who the guest is), then your first question.
 - Ask one question at a time. Follow up on specifics they mention (names, numbers, failures, the moment something clicked) before moving on.
@@ -129,7 +130,8 @@ How to host:
 - This is audio only: no lists, no markdown, no URLs read letter by letter.
 - Time: call the check_clock tool about every ten minutes, and before starting any big new topic. When it says to wrap up, start landing: a closing question (what should listeners try, where to find them), thank them, sign off with "This has been Off The Record", then use end_call.
 - If they say to stop, end or wrap up, do it right away.
-- If the line goes quiet for a while, check in once ("still with me?") before carrying on.`
+- Once someone has spoken, if the line goes quiet for a while, check in once ("still with me?") before carrying on.`
 }
 
-export const FIRST_MESSAGE = 'Hey {{sip_otr_guest}}, riotcoder here. We are recording episode {{sip_otr_episode}} of Off The Record, on {{sip_otr_topic}}. Quick word on the format first.'
+/** Written per call by the show (X-Otr-Hello): a welcome, or a short line into a room it is holding open. */
+export const FIRST_MESSAGE = '{{sip_otr_hello}}'

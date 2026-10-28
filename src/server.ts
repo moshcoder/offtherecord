@@ -193,8 +193,8 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
   app.post(
     '/api/v1/episodes',
     admin(async (c) => {
-      const b = (await c.req.json().catch(() => ({}))) as { topic?: string; variant?: string; guest?: number }
-      return c.json(json(await show.start({ ...(b.topic ? { topic: String(b.topic) } : {}), ...(b.variant ? { variant: String(b.variant) } : {}), ...(b.guest ? { guest: Number(b.guest) } : {}) })), 202)
+      const b = (await c.req.json().catch(() => ({}))) as { topic?: string; variant?: string; guest?: number; open?: boolean }
+      return c.json(json(await show.start({ ...(b.topic ? { topic: String(b.topic) } : {}), ...(b.variant ? { variant: String(b.variant) } : {}), ...(b.guest ? { guest: Number(b.guest) } : {}), ...(b.open ? { open: true } : {}) })), 202)
     }),
   )
   app.get('/api/v1/episodes/:n{[0-9]+}', admin((c) => c.json({ ...json(store.episode(Number(c.req.param('n')))), notes: store.episode(Number(c.req.param('n')))?.notes })))
