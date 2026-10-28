@@ -27,6 +27,13 @@ export const MIN_AUTOPUBLISH_SECS = 8 * 60
  * silence timeout does it: twenty minutes with nobody speaking ends its call.
  */
 export const WAIT_MINUTES = 20
+/**
+ * A host that drops mid-episode while someone is still on is dialled back in, up
+ * to three times, at least 30 seconds apart (Anthony 2026-10-28: "please dial back
+ * in if you drop do it 3 times ... then wait 30 seconds").
+ */
+export const MAX_REDIALS = 3
+export const REDIAL_GAP_MS = 30_000
 /** The note on an opened episode until its first caller arrives. */
 const WAITING = 'waiting for callers'
 
@@ -120,7 +127,7 @@ export class Show {
       this.store.update(ep.n, { room: room.code })
       await this.gc('POST', `/api/v1/rooms/${room.code}/record`, { on: true })
       if (opts.open) {
-        await this.dialHost(ep.n, true)
+        await this.dialHost(ep.n, 'waiting')
         this.store.update(ep.n, { status: 'live', note: WAITING })
         this.log(`episode ${ep.n} (${v}): host is holding room ${room.code} open for ${WAIT_MINUTES} min`)
         return this.store.episode(ep.n)!
@@ -168,6 +175,8 @@ export class Show {
   async door(): Promise<void> {
     const waiting = this.store.inStatus('live').find((e) => e.note === WAITING)
     if (waiting) return this.arrived(waiting)
+    const live = this.store.inStatus('live')[0]
+    if (live) return this.redial(live)
     if (this.opening || this.store.inStatus('calling', 'live').length) return
     this.opening = true
     try {
@@ -198,6 +207,23 @@ export class Show {
     this.log(`episode ${ep.n}: first caller is on`)
   }
 
+  /** The host's leg is gone but a caller is still on: dial it back in (see MAX_REDIALS). */
+  private async redial(ep: Episode): Promise<void> {
+    if (!ep.room || !ep.hostJoinedAt) return
+    // Past the format's length the host hung up on purpose.
+    if (Date.now() - ep.hostJoinedAt >= variant(ep.variant).minutes * 60_000) return
+    const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`)
+    const live = room.live ?? []
+    if (!live.some((p) => p.kind === 'person') || live.some((p) => p.name === HOST_NAME)) return
+    const tries = this.redials.get(ep.n) ?? 0
+    if (tries >= MAX_REDIALS || Date.now() - (this.dialedAt.get(ep.n) ?? 0) < REDIAL_GAP_MS) return
+    this.redials.set(ep.n, tries + 1)
+    await this.dialHost(ep.n, 'rejoin')
+    this.log(`episode ${ep.n}: the host dropped with a caller still on; redialled (${tries + 1}/${MAX_REDIALS})`)
+  }
+  private redials = new Map<number, number>()
+  private dialedAt = new Map<number, number>()
+
   /** Wait for the guest to be on the line, then dial the host in. */
   async bringHost(n: number): Promise<void> {
     const ep = this.store.episode(n)!
@@ -205,7 +231,7 @@ export class Show {
     while (Date.now() < until) {
       const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`).catch(() => null)
       if (room?.live?.some((p) => p.kind === 'person')) {
-        await this.dialHost(n, false)
+        await this.dialHost(n, 'start')
         this.store.update(n, { status: 'live', hostJoinedAt: Date.now() })
         this.log(`episode ${n}: the guest is on; host dialled in`)
         return
@@ -220,9 +246,11 @@ export class Show {
   /**
    * Dial the host agent into the episode's room over SIP, told the episode in X-
    * headers. `waiting`: nobody is on yet, so it greets the empty line briefly and
-   * keeps quiet until someone speaks.
+   * keeps quiet until someone speaks. `rejoin`: its leg dropped mid-episode.
    */
-  private async dialHost(n: number, waiting: boolean): Promise<void> {
+  private async dialHost(n: number, mode: 'start' | 'waiting' | 'rejoin'): Promise<void> {
+    this.dialedAt.set(n, Date.now())
+    const waiting = mode === 'waiting'
     const ep = this.store.episode(n)!
     const v = variant(ep.variant)
     const guest = ep.guestId ? this.store.guest(ep.guestId) : null
@@ -239,7 +267,7 @@ export class Show {
         'X-Otr-Guest': guestName,
         'X-Otr-About': guest ? sipValue([guest.about, guest.link].filter(Boolean).join(' '), 600) || 'nothing yet' : 'the show founder',
         'X-Otr-Waiting': waiting ? 'yes' : 'no',
-        'X-Otr-Hello': sipValue(waiting ? `riotcoder here, holding the line for episode ${ep.n} of Off The Record. Say hello when you are on.` : `Hey ${guestName}, riotcoder here. We are recording episode ${ep.n} of Off The Record, on ${topic}. Quick word on the format first.`, 300),
+        'X-Otr-Hello': sipValue(waiting ? `riotcoder here, holding the line for episode ${ep.n} of Off The Record. Say hello when you are on.` : mode === 'rejoin' ? `riotcoder back, sorry, my line dropped. Let's pick up where we left off on ${topic}.` : `Hey ${guestName}, riotcoder here. We are recording episode ${ep.n} of Off The Record, on ${topic}. Quick word on the format first.`, 300),
       },
     })
   }

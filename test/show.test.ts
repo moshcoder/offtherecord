@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, setSystemTime, test } from 'bun:test'
 import { Store } from '../src/db.ts'
 import { createApp } from '../src/server.ts'
 import { pickVariant } from '../src/variants.ts'
@@ -206,6 +206,55 @@ describe('someone dials the room themselves', () => {
     gc.setLive([{ kind: 'person', name: 'a caller' }, { kind: 'agent', name: 'riotcoder (host)' }])
     await show.door()
     expect(gc.calls.filter((c) => c.body?.sip).length).toBe(1)
+  })
+})
+
+describe('the host drops mid-episode', () => {
+  test('it is dialled back in up to 3 times, 30 seconds apart, only while a caller is on', async () => {
+    const { gc, show } = setup()
+    const t0 = Date.now()
+    try {
+      setSystemTime(t0)
+      gc.setLive([{ kind: 'person', name: 'Anthony' }])
+      await show.start({ variant: 'deep', wait: true })
+      const hosts = () => gc.calls.filter((c) => c.body?.sip)
+      expect(hosts().length).toBe(1)
+      gc.setLive([{ kind: 'person', name: 'Anthony' }, { kind: 'agent', name: 'riotcoder (host)' }])
+      await show.door()
+      expect(hosts().length).toBe(1)
+      // The host's leg is gone; Anthony is still on.
+      gc.setLive([{ kind: 'person', name: 'Anthony' }])
+      await show.door()
+      expect(hosts().length).toBe(1) // not within 30 s of the last dial
+      for (let i = 1; i <= 3; i++) {
+        setSystemTime(t0 + i * 31_000)
+        await show.door()
+        await show.door()
+        expect(hosts().length).toBe(1 + i)
+      }
+      expect(hosts().at(-1)!.body.headers['X-Otr-Hello']).toContain('my line dropped')
+      setSystemTime(t0 + 5 * 31_000)
+      await show.door()
+      expect(hosts().length).toBe(4) // three redials, then it stops
+      expect(gc.calls.some((c) => c.body?.phone && c !== gc.calls[3])).toBe(false)
+    } finally {
+      setSystemTime()
+    }
+  })
+
+  test('no redial once the caller has gone too', async () => {
+    const { gc, show } = setup()
+    const t0 = Date.now()
+    try {
+      gc.setLive([{ kind: 'person', name: 'Anthony' }])
+      await show.start({ variant: 'deep', wait: true })
+      gc.setLive([])
+      setSystemTime(t0 + 60_000)
+      await show.door()
+      expect(gc.calls.filter((c) => c.body?.sip).length).toBe(1)
+    } finally {
+      setSystemTime()
+    }
   })
 })
 
