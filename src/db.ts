@@ -128,9 +128,9 @@ export class Store {
   }
 
   episodes(opts: { published?: boolean } = {}): Episode[] {
-    // Publication times can be close enough to collide at the database's
-    // millisecond resolution. Keep the episode sequence stable in that case.
-    const sql = opts.published ? "SELECT * FROM episodes WHERE status = 'published' ORDER BY published_at DESC, n DESC" : 'SELECT * FROM episodes ORDER BY n DESC'
+    // Episode numbers are the show's canonical sequence. Publishing or
+    // editing a later episode must never move it ahead of an earlier number.
+    const sql = opts.published ? "SELECT * FROM episodes WHERE status = 'published' ORDER BY n DESC" : 'SELECT * FROM episodes ORDER BY n DESC'
     return (this.db.query(sql).all() as any[]).map((r) => this.toEpisode(r)!)
   }
 
