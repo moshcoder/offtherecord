@@ -13,6 +13,12 @@ export const SHOW = 'Off The Record'
 export const TAGLINE = 'How a Silicon Valley veteran programmer uses fleet engineering and agentic coding bots to build out a new internet.'
 export const AUTHOR = 'Anthony Ettinger'
 export const OWNER_EMAIL = 'riotcoder@profullstack.com'
+const PODCAST_AUTHOR = 'Anthony Ettinger, riotcoder, Knox, and CoinPay'
+const AGENT_ROSTER = `<section aria-labelledby="agents-title">
+<h2 id="agents-title">Profullstack agents</h2>
+<p><a href="https://dev.profullstack.com/~knox/openprofile.md">Knox</a> · VP of Sales</p>
+<p><a href="https://dev.profullstack.com/~coinpay/openprofile.md">CoinPay</a> · CFO / Accountant</p>
+</section>`
 
 export const esc = (s: unknown) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!)
 
@@ -114,6 +120,7 @@ export function homePage(episodes: { e: Episode; downloads: number }[]): string 
 <p class="lede">${esc(TAGLINE)}</p>
 <p>${esc(AUTHOR)}, founder of Profullstack, interviewed long-form by riotcoder, the AI agent that ships his code. Recorded over a phone line on <a href="https://group.call.pit.world">group.call</a>.</p>
 <div class="subscribe"><a class="btn go" href="/guest">Be a guest (free)</a><a class="btn" href="/feed.xml">Podcast feed (RSS)</a><a class="btn" href="/stats">Which format wins?</a></div>
+${AGENT_ROSTER}
 <h2>Episodes</h2>
 ${episodes.length ? episodes.map(({ e, downloads }) => episodeCard(e, downloads)).join('') : '<p class="muted">The first episode is being recorded. Subscribe to the feed and it shows up in your player.</p>'}`,
   })
@@ -219,9 +226,9 @@ ${e.transcript ? `<podcast:transcript url="${SITE}/e/${e.n}/transcript.txt" type
 <title>${SHOW}</title>
 <link>${SITE}/</link>
 <atom:link href="${SITE}/feed.xml" rel="self" type="application/rss+xml"/>
-<description>${x(TAGLINE)}</description>
+<description>${x(`${TAGLINE} Profullstack agents Knox and CoinPay are part of the show's roster.`)}</description>
 <language>en-us</language>
-<itunes:author>${x(AUTHOR)}</itunes:author>
+<itunes:author>${x(PODCAST_AUTHOR)}</itunes:author>
 <itunes:owner><itunes:name>${x(AUTHOR)}</itunes:name><itunes:email>${OWNER_EMAIL}</itunes:email></itunes:owner>
 <itunes:image href="${SITE}/cover.jpg"/>
 <image><url>${SITE}/cover.jpg</url><title>${SHOW}</title><link>${SITE}/</link></image>
