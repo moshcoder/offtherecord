@@ -15,7 +15,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@profullstack/footer": "^0.2.6",
+    "@profullstack/footer": "latest",
     "hono": "^4.13.14"
   },
   "devDependencies": {
