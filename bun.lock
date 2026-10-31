@@ -5,7 +5,7 @@
     "": {
       "name": "@profullstack/offtherecord",
       "dependencies": {
-        "@profullstack/footer": "^0.2.6",
+        "@profullstack/footer": "latest",
         "hono": "^4.13.14",
       },
       "devDependencies": {
@@ -15,7 +15,7 @@
     },
   },
   "packages": {
-    "@profullstack/footer": ["@profullstack/footer@0.2.6", "", { "peerDependencies": { "react": ">=18" }, "optionalPeers": ["react"], "bin": { "profullstack-footer": "bin/profullstack-footer.js" } }, "sha512-BKwbDszAc7e0mYIBiPjgr/5WS8WyDt8IW718s/zW/8pCWOIB1BGwSNs6fmImRSo5kqIjQKUVbXp22jZQ5GEipA=="],
+    "@profullstack/footer": ["@profullstack/footer@0.6.11", "", { "peerDependencies": { "react": ">=18" }, "optionalPeers": ["react"], "bin": { "profullstack-footer": "bin/profullstack-footer.js" } }, "sha512-9khfQbBM2p5cqMqUg8+K1atF2muYWA0AQaVI6C8gH6Cl+D+7Wc2zeaPmtDMque8HZzA3tdaqoCAAUfsufaL17Q=="],
 
     "@types/bun": ["@types/bun@1.4.4", "", { "dependencies": { "bun-types": "1.4.4" } }, "sha512-9wkRDXUXK124pEnAutE6n/l18j+i9GC5IAHK8TmX/2nlySETmky0OU6yL5U8pW1AoKh++AN9auDCr647BfurjQ=="],
 
