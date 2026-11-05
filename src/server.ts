@@ -14,6 +14,7 @@ import { startPitFooterRefresh } from './pit-footer.js'
 import { RING_PLACEHOLDER, ringBar, startRingRefresh, visitorOnMoshpit } from './ring.js'
 import { ringDescriptor, startRingFooterRefresh } from './ring-footer.js'
 import { Show, ShowError, type Config } from './show.js'
+import { Speech, voiceFor } from './speech.js'
 import { VERSION } from './version.js'
 
 export { VERSION }
@@ -52,8 +53,8 @@ export function normalizePhone(raw: string): string | null {
 /** Sign-ups accepted per hour, all guests together: a cap on a flood, not on people. */
 const GUESTS_PER_HOUR = 30
 
-export function createApp(deps: { store: Store; config: Config; adminKey: string; salt: string }) {
-  const { store, config } = deps
+export function createApp(deps: { store: Store; config: Config; adminKey: string; salt: string; speech?: Speech }) {
+  const { store, config, speech } = deps
   const show = new Show(store, config)
   const app = new Hono<Env>()
 
@@ -159,6 +160,19 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
     return new Response(file.slice(start, end + 1), { status: 206, headers: { ...base, 'content-range': `bytes ${start}-${end}/${size}`, 'content-length': String(end - start + 1) } })
   })
 
+  /**
+   * One line of a co-host's speech, rendered on c0mpute and waiting for Telnyx
+   * to fetch it. Unauthenticated on purpose: Telnyx's media loader carries none
+   * of our credentials, so the path itself is the secret — an HMAC of the line's
+   * id that expires with the file (see speech.ts).
+   */
+  app.get('/speech/:file{[0-9a-f]{32}\\.wav}', async (c) => {
+    const wav = speech ? await speech.read(c.req.param('file').replace(/\.wav$/, '')) : null
+    if (!wav) return c.text('No such line.', 404)
+    // A Uint8Array is not a BodyInit under TS 7: hand Response the buffer.
+    return new Response(new Blob([wav.buffer as ArrayBuffer]), { headers: { 'content-type': 'audio/wav', 'content-length': String(wav.length), 'cache-control': 'private, max-age=60' } })
+  })
+
   /** The web player's listen-through beacon (25/50/75/100%). */
   app.post('/api/listen', async (c) => {
     const b = (await c.req.json().catch(() => ({}))) as { n?: unknown; pct?: unknown }
@@ -187,14 +201,14 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
     }
   }
   const json = (e: ReturnType<Store['episode']>) =>
-    e && { n: e.n, title: e.title, topic: e.topic, variant: e.variant, guest: e.guestId, status: e.status, room: e.room, duration_secs: e.durationSecs, note: e.note || undefined, created_at: new Date(e.createdAt).toISOString(), published_at: e.publishedAt ? new Date(e.publishedAt).toISOString() : null, page: `${SITE}/e/${e.n}`, preview: e.audioPath ? `${SITE}/api/v1/episodes/${e.n}/audio.mp3` : null }
+    e && { n: e.n, title: e.title, topic: e.topic, variant: e.variant, guest: e.guestId, status: e.status, room: e.room, cohosts: e.cohosts || undefined, duration_secs: e.durationSecs, note: e.note || undefined, created_at: new Date(e.createdAt).toISOString(), published_at: e.publishedAt ? new Date(e.publishedAt).toISOString() : null, page: `${SITE}/e/${e.n}`, preview: e.audioPath ? `${SITE}/api/v1/episodes/${e.n}/audio.mp3` : null }
 
   app.get('/api/v1/episodes', admin((c) => c.json({ episodes: store.episodes().map(json) })))
   app.post(
     '/api/v1/episodes',
     admin(async (c) => {
-      const b = (await c.req.json().catch(() => ({}))) as { topic?: string; variant?: string; guest?: number; open?: boolean }
-      return c.json(json(await show.start({ ...(b.topic ? { topic: String(b.topic) } : {}), ...(b.variant ? { variant: String(b.variant) } : {}), ...(b.guest ? { guest: Number(b.guest) } : {}), ...(b.open ? { open: true } : {}) })), 202)
+      const b = (await c.req.json().catch(() => ({}))) as { topic?: string; variant?: string; guest?: number; open?: boolean; cohosts?: boolean }
+      return c.json(json(await show.start({ ...(b.topic ? { topic: String(b.topic) } : {}), ...(b.variant ? { variant: String(b.variant) } : {}), ...(b.guest ? { guest: Number(b.guest) } : {}), ...(b.open ? { open: true } : {}), ...(b.cohosts ? { cohosts: true } : {}) })), 202)
     }),
   )
   app.get('/api/v1/episodes/:n{[0-9]+}', admin((c) => c.json({ ...json(store.episode(Number(c.req.param('n')))), notes: store.episode(Number(c.req.param('n')))?.notes })))
@@ -229,6 +243,42 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
       return c.json(guestJson(g))
     }),
   )
+  // ---- the co-hosts' voices --------------------------------------------------------
+
+  /**
+   * Render one spoken line in a co-host's own Kokoro voice on c0mpute and answer
+   * with the URL Telnyx should play. The caller is the thing driving the phone
+   * leg (ops/agent-phone.mjs), which holds the admin key; listeners never touch
+   * this.
+   */
+  app.post(
+    '/api/v1/speech/say',
+    admin(async (c) => {
+      if (!speech) throw new ShowError('No c0mpute speech gateway is configured.', 503)
+      const b = (await c.req.json().catch(() => ({}))) as { agent?: string; text?: string; id?: string }
+      const text = String(b.text ?? '').trim()
+      if (!text) throw new ShowError('text is required.')
+      const agent = String(b.agent ?? 'riotcoder')
+      const id = String(b.id ?? '').trim() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const line = await speech.say(agent, text, id)
+      if (!line) throw new ShowError(`c0mpute could not render that line in ${voiceFor(agent)}.`, 503)
+      return c.json(line)
+    }),
+  )
+  /** Pin the hosts' warm workers before an episode, so the first line is not the slow one. */
+  app.post(
+    '/api/v1/speech/warm',
+    admin(async (c) => {
+      if (!speech) throw new ShowError('No c0mpute speech gateway is configured.', 503)
+      const b = (await c.req.json().catch(() => ({}))) as { agents?: unknown }
+      const agents = Array.isArray(b.agents) && b.agents.length ? b.agents.map(String) : ['riotcoder', 'cha0spunk']
+      return c.json({ warm: await speech.warm(agents) })
+    }),
+  )
+  app.get('/api/v1/speech/sessions', admin(async (c) => c.json((await speech?.list()) ?? { error: 'no gateway' })))
+  /** What the operator's box needs to put riotcoder and cha0spunk on the line. */
+  app.get('/api/v1/episodes/:n{[0-9]+}/cohosts', admin(async (c) => c.json(await show.cohostPlan(Number(c.req.param('n'))))))
+
   app.post('/api/v1/host/sync', admin(async (c) => c.json(await show.syncHost())))
   app.get('/api/v1/stats', admin((c) => c.json({ arms: store.armStats() })))
 
@@ -244,8 +294,24 @@ export function serve() {
   }
   const store = new Store(env.OTR_DB ?? `${state}/offtherecord.db`)
   const ffmpeg = Bun.which('ffmpeg')
+  /**
+   * The co-hosts' voices, when this box can reach a c0mpute speech gateway. The
+   * gateway listens on loopback, so this works because the show runs as a unit
+   * on the host rather than in a container of its own.
+   */
+  const speech =
+    env.C0MPUTE_SPEECH_URL && env.C0MPUTE_SPEECH_TOKEN
+      ? new Speech({
+          baseUrl: env.C0MPUTE_SPEECH_URL,
+          token: env.C0MPUTE_SPEECH_TOKEN,
+          audioDir: `${state}/audio`,
+          secret: env.OTR_SPEECH_SECRET ?? need('OTR_ADMIN_KEY'),
+          origin: env.OTR_ORIGIN ?? SITE,
+        })
+      : undefined
   const { app, show } = createApp({
     store,
+    speech,
     adminKey: need('OTR_ADMIN_KEY'),
     salt: need('OTR_SALT'),
     config: {
@@ -257,6 +323,14 @@ export function serve() {
       guestName: env.OTR_GUEST_NAME ?? 'Anthony',
       hostSip: need('OTR_HOST_SIP'),
       hostToolSecret: need('OTR_HOST_TOOL_SECRET'),
+      // riotcoder=+14159185508,cha0spunk=+15107667447: the number that names each
+      // co-host to group.call when its leg dials in.
+      cohostCallerIds: Object.fromEntries(
+        (env.OTR_COHOST_CALLER_IDS ?? '')
+          .split(',')
+          .map((pair) => pair.split('=').map((x) => x.trim()))
+          .filter((kv): kv is [string, string] => kv.length === 2 && Boolean(kv[0]) && /^\+\d{8,15}$/.test(kv[1] ?? '')),
+      ),
       ...(env.ELEVENLABS_API_KEY ? { elevenlabsKey: env.ELEVENLABS_API_KEY } : {}),
       ...(env.OTR_AGENT_ID ? { agentId: env.OTR_AGENT_ID } : {}),
       ...(env.GEMINI_API_KEY ? { geminiKey: env.GEMINI_API_KEY } : {}),
