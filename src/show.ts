@@ -235,7 +235,7 @@ export class Show {
         voice: c.voice,
         ...(this.config.cohostCallerIds?.[c.agent] ? { from: this.config.cohostCallerIds[c.agent] } : {}),
         // Let a leg outlast the format a little, so the close is never cut off.
-        maxMinutes: Math.min(60, v.minutes + 5),
+        maxMinutes: Math.min(125, v.minutes + 5),
         brief: cohostBrief({ agent: c.agent, episode: ep.n, topic: ep.topic, variant: v.key, guestName, ...(guest?.about ? { about: guest.about } : {}) }),
       })),
     }
