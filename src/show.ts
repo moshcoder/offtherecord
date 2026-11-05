@@ -241,6 +241,38 @@ export class Show {
     }
   }
 
+  /**
+   * Ring the guest once the hosts are actually in the room.
+   *
+   * A co-hosted episode starts without a ring, because its hosts take half a
+   * minute to dial in and key the code, and Anthony has been first into an empty
+   * room before (2026-10-28: "nobody in room ... the host should be there
+   * first"). This waits for a host's leg and then rings, so the phone goes off
+   * when there is somebody there to say hello.
+   */
+  async ringWhenHostsAreOn(n: number, waitMs = 90_000): Promise<Episode> {
+    const ep = this.store.episode(n)
+    if (!ep) throw new ShowError('No such episode.', 404)
+    if (!ep.room) throw new ShowError('That episode has no room yet.', 409)
+    if (ep.status !== 'calling' && ep.status !== 'live') throw new ShowError(`Episode ${n} is ${ep.status}.`, 409)
+    const until = Date.now() + waitMs
+    for (;;) {
+      const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`).catch(() => null)
+      const live = room?.live ?? []
+      if (live.some((p) => p.kind === 'agent')) break
+      // Somebody beat us to it: ring nobody, they are already on.
+      if (live.some((p) => p.kind === 'person')) return this.store.episode(n)!
+      if (Date.now() >= until) throw new ShowError(`No host reached room ${ep.room} within ${Math.round(waitMs / 1000)}s; the guest was not rung.`, 504)
+      await new Promise((ok) => setTimeout(ok, 3000))
+    }
+    await this.retry('ringing the guest', () => this.ringGuest(n))
+    this.store.update(n, { rang: true })
+    const guest = ep.guestId ? this.store.guest(ep.guestId) : null
+    if (guest) this.store.setGuestStatus(guest.id, 'booked')
+    this.log(`episode ${n}: the hosts are in room ${ep.room}; ringing the guest`)
+    return this.store.episode(n)!
+  }
+
   /** Ring the episode's guest (a signed-up guest's phone, or Anthony's). */
   private async ringGuest(n: number): Promise<void> {
     this.store.update(n, { lastRingAt: Date.now() })
