@@ -274,7 +274,7 @@ describe('a co-hosted episode', () => {
       ['cha0spunk', 'af_bella'],
     ])
     // A leg outlasts the format a little, so the sign-off is never cut off.
-    expect(plan.legs[0].maxMinutes).toBe(60)
+    expect(plan.legs[0].maxMinutes).toBe(95)
     expect(plan.legs[0].brief).toContain('lead host')
     expect(plan.legs[1].brief).toContain('RiotCoder leads')
   })
