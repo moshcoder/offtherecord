@@ -6,6 +6,10 @@
  *       ring Anthony (or a signed-up guest) into a recorded room; the host dials in on pickup
  *   otr open [--topic "..."] [--variant ...]
  *       put the host in the room first, holding it 20 min for anyone who dials in
+ *   otr cohosts [--topic "..."] [--variant ...] [--guest <id>]
+ *       riotcoder AND cha0spunk interview the guest, each in its own voice off
+ *       c0mpute (no ElevenLabs). Run this where agent-phone lives: it rings the
+ *       guest and puts both co-host legs on the line.
  *   otr guests                   sign-ups from /guest, newest first
  *   otr guest <id> decline|new   mark a sign-up
  *   otr episodes                 every episode and its state
@@ -42,6 +46,62 @@ try {
     case 'open': {
       const e = await call('POST', '/api/v1/episodes', { open: true, ...(flag('topic') ? { topic: flag('topic') } : {}), ...(flag('variant') ? { variant: flag('variant') } : {}) })
       console.log(`episode ${e.n} (${e.variant}): the host is in room ${e.room}, holding it 20 min. Dial 510-616-9327, code ${e.room}#.`)
+      break
+    }
+    /**
+     * A co-hosted episode: our two agents interview the guest instead of the one
+     * ElevenLabs host agent, and each speaks in the Kokoro voice its OpenProfile
+     * names, rendered on the c0mpute network (Anthony 2026-11-05: "have you and
+     * chaospunk interview me use your voice from your profiles ... make sure you
+     * use c0mpute not eleven labs").
+     *
+     * The legs run here rather than on the show's box: this is where the phone
+     * tooling and the turn model live. The show stays the editorial side — who
+     * hosts, in which voice, with what brief — and hands it over.
+     */
+    case 'cohosts': {
+      const phone = process.env.OTR_AGENT_PHONE ?? 'agent-phone'
+      if (!Bun.which(phone)) throw new Error(`${phone} is not on PATH: run this where agent-phone is installed, or set OTR_AGENT_PHONE.`)
+      const ep = await call('POST', '/api/v1/episodes', { cohosts: true, ...(flag('topic') ? { topic: flag('topic') } : {}), ...(flag('variant') ? { variant: flag('variant') } : {}), ...(flag('guest') ? { guest: Number(flag('guest')) } : {}) })
+      // Pin both warm Kokoro workers before anyone speaks, so the first line of
+      // the show is not the slow one.
+      const warm = await call('POST', '/api/v1/speech/warm', { agents: ['riotcoder', 'cha0spunk'] }).catch((e: unknown) => ({ warm: [], error: e instanceof Error ? e.message : String(e) }))
+      console.log(`episode ${ep.n} (${ep.variant}): ringing ${ep.guest ? `guest #${ep.guest}` : 'Anthony'} into room ${ep.room}. Voices warm: ${(warm.warm ?? []).join(', ') || `none (${warm.error ?? 'gateway said no'})`}`)
+      const plan = await call('GET', `/api/v1/episodes/${ep.n}/cohosts`)
+      const dir = `${process.env.HOME}/.local/share/offtherecord/legs`
+      await Bun.$`mkdir -p ${dir}`.quiet()
+      for (const leg of plan.legs) {
+        const out = `${dir}/ep${plan.episode}-${leg.agent}.out`
+        const args = [
+          'join', plan.dialIn,
+          '--pin', plan.room,
+          '--agent', leg.agent,
+          '--room', 'Off The Record',
+          '--goal', leg.brief,
+          '--podcast',
+          // Two hosts, one human guest: the hosts interview him and never
+          // answer a question the other one put to him.
+          '--interview',
+          '--template', 'otr-turn.md',
+          '--persona', `${leg.onAir}, ${leg.role} of Off The Record and one of Anthony's own AI agents.`,
+          '--voice-engine', 'c0mpute',
+          '--max-minutes', String(leg.maxMinutes),
+          '--json',
+          ...(leg.from ? ['--from', leg.from] : []),
+        ]
+        const log = Bun.file(out).writer()
+        Bun.spawn([phone, ...args], {
+          stdout: log as unknown as number,
+          stderr: log as unknown as number,
+          env: { ...process.env, AGENT_PHONE_VOICE_ENGINE: 'c0mpute', AGENT_PHONE_SPEECH_URL: base, AGENT_PHONE_SPEECH_KEY: key! },
+          // The episode outlives this command.
+          stdin: 'ignore',
+        }).unref()
+        console.log(`  ${leg.onAir} (${leg.voice}${leg.from ? ` from ${leg.from}` : ''}) dialling ${plan.dialIn} code ${plan.room}, up to ${leg.maxMinutes} min -> ${out}`)
+        // The lead host goes in first, and two legs never key the code at once.
+        await Bun.sleep(4000)
+      }
+      console.log(`watch: tail -f ${dir}/ep${plan.episode}-*.out    then: otr show ${plan.episode}`)
       break
     }
     case 'guests':

@@ -14,7 +14,7 @@
  */
 import { mkdirSync, renameSync, unlinkSync } from 'node:fs'
 import type { Episode, Store } from './db.js'
-import { FIRST_MESSAGE, hostPrompt, pickTopic, pickVariant, variant } from './variants.js'
+import { COHOSTS, cohostBrief, FIRST_MESSAGE, hostPrompt, pickTopic, pickVariant, variant } from './variants.js'
 
 
 /** Shorter than this, a finished episode waits for `otr publish` instead of going out on its own. */
@@ -62,6 +62,13 @@ export type Config = {
   guestName: string
   /** The host agent's SIP URI, e.g. sip:+15106169327@sip.rtc.elevenlabs.io;transport=tcp */
   hostSip: string
+  /**
+   * The number each co-host dials out from, e.g. { riotcoder: '+14159185508' }.
+   * group.call names a caller by its number (GROUPCALL_AGENT_CALLER_IDS), so this
+   * is what makes a leg show up as that agent — and so what the recording's
+   * transcript, and the show notes written from it, call each voice.
+   */
+  cohostCallerIds?: Record<string, string>
   elevenlabsKey?: string
   agentId?: string
   /** Sent by the host's clock tool, so only it can read the clock. */
@@ -152,7 +159,7 @@ export class Show {
    * Start an episode: make the room, ring the guest. The host is dialled in by
    * `bringHost` once the guest is on the line (awaited here only in tests).
    */
-  async start(opts: { topic?: string; variant?: string; guest?: number; wait?: boolean; dialIn?: boolean; open?: boolean } = {}): Promise<Episode> {
+  async start(opts: { topic?: string; variant?: string; guest?: number; wait?: boolean; dialIn?: boolean; open?: boolean; cohosts?: boolean } = {}): Promise<Episode> {
     await this.closeStale()
     if (this.store.inStatus('calling', 'live').length) throw new ShowError('An episode is already being recorded.', 409)
     const guest = opts.guest ? this.store.guest(opts.guest) : null
@@ -160,7 +167,7 @@ export class Show {
     const all = this.store.episodes()
     const v = opts.variant ? variant(opts.variant).key : pickVariant(all.map((e) => ({ variant: e.variant, n: e.n })))
     const topic = (opts.topic ?? guest?.topic ?? '').replace(/\s+/g, ' ').trim().slice(0, 180) || pickTopic(all.map((e) => e.topic))
-    const ep = this.store.addEpisode({ topic, variant: v, guestId: guest?.id ?? null })
+    const ep = this.store.addEpisode({ topic, variant: v, guestId: guest?.id ?? null, cohosts: !!opts.cohosts })
     try {
       // One room for the show (an account has only a few); recordings are told apart by when they started.
       const room = await this.retry('finding the room', async () => {
@@ -169,7 +176,9 @@ export class Show {
       })
       this.store.update(ep.n, { room: room.code })
       await this.retry('turning recording on', () => this.gc('POST', `/api/v1/rooms/${room.code}/record`, { on: true }))
-      if (opts.open) {
+      if (opts.open && opts.cohosts) {
+        throw new ShowError('Co-hosted episodes are opened by their own legs, not by a SIP dial.', 400)
+      } else if (opts.open) {
         await this.retry('dialling the host', () => this.dialHost(ep.n, 'waiting'))
         this.store.update(ep.n, { status: 'live', note: WAITING })
         this.log(`episode ${ep.n} (${v}): host is holding room ${room.code} open for ${WAIT_MINUTES} min`)
@@ -192,6 +201,44 @@ export class Show {
     if (opts.wait) await host
     else void host.catch((e) => this.log(`episode ${ep.n}: ${e}`))
     return this.store.episode(ep.n)!
+  }
+
+  /**
+   * Everything the operator's box needs to put the two co-hosts on the line: the
+   * room and the number to dial it on, and one brief per host.
+   *
+   * The legs themselves run where the phone tooling and the model live (the
+   * operator's box, ops/agent-phone.mjs), not here; the show owns the editorial
+   * side — who hosts, in which voice, with what brief — and hands it over.
+   */
+  async cohostPlan(n: number): Promise<{ episode: number; room: string; dialIn: string; variant: string; minutes: number; topic: string; legs: { agent: string; onAir: string; role: string; voice: string; from?: string; maxMinutes: number; brief: string }[] }> {
+    const ep = this.store.episode(n)
+    if (!ep) throw new ShowError('No such episode.', 404)
+    if (!ep.room) throw new ShowError('That episode has no room yet.', 409)
+    const { rooms } = await this.gc<{ rooms: { code: string; dial_in?: string }[] }>('GET', '/api/v1/rooms')
+    const dialIn = rooms.find((r) => r.code === ep.room)?.dial_in
+    if (!dialIn) throw new ShowError(`group.call gave no dial-in number for room ${ep.room}.`, 502)
+    const v = variant(ep.variant)
+    const guest = ep.guestId ? this.store.guest(ep.guestId) : null
+    const guestName = guest?.name ?? DEFAULT_GUEST
+    return {
+      episode: ep.n,
+      room: ep.room,
+      dialIn,
+      variant: v.key,
+      minutes: v.minutes,
+      topic: ep.topic,
+      legs: COHOSTS.map((c) => ({
+        agent: c.agent,
+        onAir: c.onAir,
+        role: c.role,
+        voice: c.voice,
+        ...(this.config.cohostCallerIds?.[c.agent] ? { from: this.config.cohostCallerIds[c.agent] } : {}),
+        // Let a leg outlast the format a little, so the close is never cut off.
+        maxMinutes: Math.min(60, v.minutes + 5),
+        brief: cohostBrief({ agent: c.agent, episode: ep.n, topic: ep.topic, variant: v.key, guestName, ...(guest?.about ? { about: guest.about } : {}) }),
+      })),
+    }
   }
 
   /** Ring the episode's guest (a signed-up guest's phone, or Anthony's). */
@@ -282,7 +329,7 @@ export class Show {
     const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`)
     const live = room.live ?? []
     const caller = live.some((p) => p.kind === 'person')
-    const host = live.some((p) => p.name === HOST_NAME)
+    const host = ep.cohosts ? live.some((p) => p.kind === 'agent') : live.some((p) => p.name === HOST_NAME)
     if (caller && host) {
       this.missing.delete(ep.n)
       return
@@ -293,13 +340,21 @@ export class Show {
       if (now - ep.lastDialAt < REDIAL_GAP_MS) return
     } else if (now - ep.lastRingAt < RING_GAP_MS) return
     // The host gone: was that a goodbye? (With the host still in the room, it was not.)
-    if (!host) {
+    if (!host && !ep.cohosts) {
       const off = await this.hostSignedOff(ep)
       if (off === 'yes') return
       // ElevenLabs has not closed the host's conversation yet: give it a minute to say why it ended.
       if (!this.missing.has(ep.n)) this.missing.set(ep.n, now)
       if (off === 'pending' && now - this.missing.get(ep.n)! < 60_000) return
       if (off === 'unknown' && !caller) return // cannot tell a drop from a goodbye: leave it
+    }
+    if (caller && ep.cohosts) {
+      // Our own legs are driven from the operator's box, so the show cannot dial
+      // them back itself; what it can do is not leave the episode looking live.
+      if (ep.hostRedials >= MAX_REDIALS) return this.abandon(ep, 'the co-hosts dropped and could not be brought back')
+      this.store.update(ep.n, { hostRedials: ep.hostRedials + 1, lastDialAt: now })
+      this.log(`episode ${ep.n}: a co-host leg is missing with the guest still on (${ep.hostRedials + 1}/${MAX_REDIALS})`)
+      return
     }
     if (caller) {
       if (ep.hostRedials >= MAX_REDIALS) return this.abandon(ep, `the host dropped and did not come back after ${MAX_REDIALS} redials`)
@@ -371,6 +426,14 @@ export class Show {
       const room = await this.gc<{ live?: { kind: string; name: string }[] }>('GET', `/api/v1/rooms/${ep.room}`).catch(() => null)
       if (room?.live?.some((p) => p.kind === 'person')) {
         this.store.update(n, { status: 'live', hostJoinedAt: Date.now() })
+        // Co-hosted: riotcoder and cha0spunk are already dialling in on their own
+        // legs (ops/agent-phone.mjs), each speaking its own voice off c0mpute.
+        // There is no SIP host agent to bring, and dialling one would put a third
+        // interviewer on the line.
+        if (ep.cohosts) {
+          this.log(`episode ${n}: the guest is on; the co-hosts have the room`)
+          return
+        }
         try {
           await this.retry('dialling the host', () => this.dialHost(n, 'start'))
           this.log(`episode ${n}: the guest is on; host dialled in`)
