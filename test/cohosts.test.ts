@@ -9,7 +9,7 @@
 import { describe, expect, test } from 'bun:test'
 import { Store } from '../src/db.ts'
 import { createApp } from '../src/server.ts'
-import { audioToken, Speech, voiceFor, wavSeconds } from '../src/speech.ts'
+import { audioToken, levelWav, PEAK_CEILING_DBFS, RMS_TARGET_DBFS, Speech, voiceFor, wavSeconds } from '../src/speech.ts'
 import { cohostBrief, COHOSTS } from '../src/variants.ts'
 
 /** A valid 16-bit mono WAV of `samples` frames at 24 kHz, as Kokoro returns. */
@@ -342,5 +342,72 @@ describe('ringing the guest after the hosts', () => {
     const ep = (await (await req('POST', '/api/v1/episodes', { cohosts: true, dialIn: true })).json()) as { n: number }
     await expect(show.ringWhenHostsAreOn(ep.n, 10)).rejects.toThrow(/No host reached room 8625/)
     expect(gc.calls.filter((c) => c.path === '/api/v1/rooms/8625/call').length).toBe(0)
+  })
+})
+
+describe('levelling a line for the phone', () => {
+  /**
+   * A WAV shaped like speech rather than a tone: bursts with gaps between them,
+   * so its RMS sits far below its peak the way a spoken line's does. A steady
+   * sine is only 3 dB peak-to-RMS and needs no lifting at all.
+   */
+  const speech = (peak: number, samples = 24000, duty = 0.2) => {
+    const bytes = wav(samples)
+    const pcm = new Int16Array(bytes.buffer, bytes.byteOffset + 44, samples)
+    for (let i = 0; i < samples; i++) {
+      const sounding = i % 1000 < 1000 * duty
+      pcm[i] = sounding ? Math.round(Math.sin((i / 24) * Math.PI * 2) * peak * 32767) : 0
+    }
+    return bytes
+  }
+  const levels = (bytes: Uint8Array) => {
+    const pcm = new Int16Array(bytes.buffer, bytes.byteOffset + 44, Math.floor((bytes.length - 44) / 2))
+    let pk = 0
+    let ss = 0
+    for (const x of pcm) {
+      const a = Math.abs(x) / 32768
+      if (a > pk) pk = a
+      ss += a * a
+    }
+    return { peakDb: 20 * Math.log10(pk), rmsDb: 20 * Math.log10(Math.sqrt(ss / pcm.length)) }
+  }
+
+  test('a quiet line is brought up, and never over the ceiling', () => {
+    // Kokoro renders about here: peak -10 dBFS, well under what a phone wants.
+    const bytes = speech(0.3)
+    const before = levels(bytes)
+    expect(before.peakDb).toBeLessThan(-9)
+    const gain = levelWav(bytes)
+    expect(gain).toBeGreaterThan(0)
+    const after = levels(bytes)
+    expect(after.peakDb).toBeGreaterThan(before.peakDb)
+    // The contract is the RMS target: that is what a phone line is quiet against.
+    expect(after.rmsDb).toBeCloseTo(RMS_TARGET_DBFS, 0)
+    // The ceiling holds, with a little room for rounding into 16 bits.
+    expect(after.peakDb).toBeLessThanOrEqual(PEAK_CEILING_DBFS + 0.3)
+  })
+
+  test('a line already at level is left alone', () => {
+    // Peaking just under the ceiling with a healthy RMS: nothing to add.
+    expect(levelWav(speech(0.89, 24000, 0.9))).toBe(0)
+  })
+
+  test('silence is not amplified into noise', () => {
+    const bytes = wav(2400)
+    expect(levelWav(bytes)).toBe(0)
+    expect(new Int16Array(bytes.buffer, bytes.byteOffset + 44, 2400).every((x) => x === 0)).toBe(true)
+  })
+
+  test('a header with no samples is not an error', () => {
+    expect(levelWav(new Uint8Array(44))).toBe(0)
+    expect(levelWav(new Uint8Array(8))).toBe(0)
+  })
+
+  test('a rendered line reports the gain it was given', async () => {
+    const { req } = setup()
+    const said = await req('POST', '/api/v1/speech/say', { agent: 'riotcoder', text: 'Level check.', id: 'lvl' })
+    const line = (await said.json()) as { gainDb?: number }
+    // The fake gateway returns silence, which is never lifted.
+    expect(line.gainDb).toBeUndefined()
   })
 })

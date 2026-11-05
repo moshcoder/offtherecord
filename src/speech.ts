@@ -81,6 +81,8 @@ export type SpokenLine = {
   /** What the node spent rendering it. */
   synthMs: number
   voice: string
+  /** How much it was levelled up by, in dB. */
+  gainDb?: number
 }
 
 type Session = { id: string; voice: string; utterances: number }
@@ -100,6 +102,66 @@ export function wavSeconds(wav: Uint8Array): number {
   const bytesPerFrame = (bits / 8) * channels
   if (!rate || !bytesPerFrame) return 0
   return Math.round(((wav.length - 44) / bytesPerFrame / rate) * 100) / 100
+}
+
+/**
+ * How hot a line is sent down the phone: peak ceiling and RMS target, in dBFS.
+ *
+ * Kokoro renders well below the level a hosted TTS sends, and on a conference
+ * bridge that is the difference between a host you can hear and one you cannot
+ * (Anthony, on air, 2026-11-05: "voice are not loud enough on group call"). So
+ * every line is levelled before it is cached: brought up to the RMS a phone
+ * expects, and held under the peak ceiling so it never clips.
+ */
+export const PEAK_CEILING_DBFS = -1
+export const RMS_TARGET_DBFS = -18
+/** Never apply more than this, or quiet passages turn into noise. */
+export const MAX_GAIN_DB = 20
+
+const dbToGain = (db: number) => 10 ** (db / 20)
+
+/** Where a WAV's `data` chunk starts and how long it is. */
+function dataChunk(wav: Uint8Array): { at: number; length: number } | null {
+  const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength)
+  const tag = (at: number) => String.fromCharCode(wav[at]!, wav[at + 1]!, wav[at + 2]!, wav[at + 3]!)
+  let at = 12
+  while (at + 8 <= wav.length) {
+    const id = tag(at)
+    const size = view.getUint32(at + 4, true)
+    if (id === 'data') return { at: at + 8, length: Math.min(size, wav.length - at - 8) }
+    at += 8 + size + (size % 2)
+  }
+  return null
+}
+
+/**
+ * Level one 16-bit PCM WAV in place and say what gain was applied.
+ *
+ * Peak-normalised to the ceiling, then lifted further towards the RMS target
+ * if it is still quiet, with the ceiling always winning so nothing clips.
+ */
+export function levelWav(wav: Uint8Array): number {
+  const data = dataChunk(wav)
+  if (!data || data.length < 2) return 0
+  const samples = new Int16Array(wav.buffer, wav.byteOffset + data.at, Math.floor(data.length / 2))
+  let peak = 0
+  let sumSquares = 0
+  for (const sample of samples) {
+    const x = Math.abs(sample) / 32768
+    if (x > peak) peak = x
+    sumSquares += x * x
+  }
+  if (!peak || !samples.length) return 0
+  const rms = Math.sqrt(sumSquares / samples.length)
+  const ceiling = dbToGain(PEAK_CEILING_DBFS)
+  // As loud as the ceiling allows, but no louder than the RMS target wants.
+  const wanted = rms > 0 ? dbToGain(RMS_TARGET_DBFS) / rms : ceiling / peak
+  const gain = Math.min(ceiling / peak, Math.max(1, wanted), dbToGain(MAX_GAIN_DB))
+  if (gain <= 1.01) return 0
+  for (let i = 0; i < samples.length; i++) {
+    samples[i] = Math.max(-32768, Math.min(32767, Math.round(samples[i]! * gain)))
+  }
+  return Math.round(20 * Math.log10(gain) * 10) / 10
 }
 
 /** A WAV, not an error page: RIFF....WAVE, and long enough to be speech. */
@@ -220,6 +282,7 @@ export class Speech {
     }
     if (!session || !said || said === 'gone' || !looksLikeSpeech(said.wav)) return null
     session.utterances += 1
+    const gainDb = levelWav(said.wav)
 
     const token = audioToken(id, this.config.secret)
     try {
@@ -234,6 +297,7 @@ export class Speech {
       seconds: wavSeconds(said.wav),
       synthMs: said.synthMs,
       voice,
+      ...(gainDb ? { gainDb } : {}),
     }
   }
 
