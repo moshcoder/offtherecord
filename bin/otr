@@ -91,6 +91,12 @@ try {
           '--persona', `${leg.onAir}, ${leg.role} of Off The Record and one of Anthony's own AI agents.`,
           '--voice-engine', 'c0mpute',
           '--max-minutes', String(leg.maxMinutes),
+          // Where THIS episode's memory starts. A room keeps its transcript
+          // between calls and every episode is recorded in the same one, so
+          // without this a retake inherits the take it is replacing: episodes 8
+          // and 9 were twenty-one minutes apart, inside the leg's own default
+          // window. The show is the only side that knows when a sitting began.
+          ...(ep.created_at ? ['--memory-since', String(ep.created_at)] : []),
           '--json',
           ...(leg.from ? ['--from', leg.from] : []),
         ]
