@@ -62,8 +62,9 @@ function gateway(opts: { loseSessionOnce?: boolean; junk?: boolean; openFails?: 
 }
 
 /** A fake group.call that knows the show's room and its dial-in number. */
-function groupcall(live: { kind: string; name: string }[] = []) {
+function groupcall(initial: { kind: string; name: string }[] = []) {
   const calls: { method: string; path: string; body: any }[] = []
+  let live = initial
   const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const u = new URL(String(url))
     const method = init?.method ?? 'GET'
@@ -77,7 +78,7 @@ function groupcall(live: { kind: string; name: string }[] = []) {
     if (u.pathname.endsWith('/recordings')) return json({ recordings: [] })
     return json({ error: 'not found' }, 404)
   }) as unknown as typeof globalThis.fetch
-  return { calls, fetch }
+  return { calls, fetch, setLive: (l: typeof live) => (live = l) }
 }
 
 function speechFor(gw: ReturnType<typeof gateway>, dir?: string) {
@@ -308,5 +309,38 @@ describe("the co-hosts' brief", () => {
     expect(brief).toContain('I build a Rust TUI for ops.')
     expect(brief).not.toContain('Moshpit')
     expect(brief).toContain('about 35 minutes')
+  })
+})
+
+describe('ringing the guest after the hosts', () => {
+  test('waits for a host leg, then rings', async () => {
+    const { gc, req, show } = setup({ live: [] })
+    const ep = (await (await req('POST', '/api/v1/episodes', { cohosts: true, dialIn: true, topic: 'Hosts first', variant: 'riff' })).json()) as { n: number }
+    // Nobody was rung when the episode started: the room was empty.
+    expect(gc.calls.filter((c) => c.path === '/api/v1/rooms/8625/call').length).toBe(0)
+    // A host dials in, and the ring goes out.
+    const ringing = show.ringWhenHostsAreOn(ep.n, 20_000)
+    gc.setLive([{ kind: 'agent', name: 'riotcoder' }])
+    const after = await ringing
+    expect(after.rang).toBe(true)
+    const rings = gc.calls.filter((c) => c.path === '/api/v1/rooms/8625/call')
+    expect(rings.length).toBe(1)
+    expect(rings[0]!.body.phone).toBe('+14085550101')
+    expect(rings[0]!.body.sip).toBeUndefined()
+  })
+
+  test('a guest already on the line is not rung', async () => {
+    const { gc, req, show } = setup({ live: [{ kind: 'person', name: 'Anthony' }] })
+    const ep = (await (await req('POST', '/api/v1/episodes', { cohosts: true, dialIn: true })).json()) as { n: number }
+    const after = await show.ringWhenHostsAreOn(ep.n, 5_000)
+    expect(after.rang).toBe(false)
+    expect(gc.calls.filter((c) => c.path === '/api/v1/rooms/8625/call').length).toBe(0)
+  })
+
+  test('no host within the wait is an error, not a ring into an empty room', async () => {
+    const { gc, req, show } = setup({ live: [] })
+    const ep = (await (await req('POST', '/api/v1/episodes', { cohosts: true, dialIn: true })).json()) as { n: number }
+    await expect(show.ringWhenHostsAreOn(ep.n, 10)).rejects.toThrow(/No host reached room 8625/)
+    expect(gc.calls.filter((c) => c.path === '/api/v1/rooms/8625/call').length).toBe(0)
   })
 })

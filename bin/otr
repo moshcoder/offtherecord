@@ -62,11 +62,14 @@ try {
     case 'cohosts': {
       const phone = process.env.OTR_AGENT_PHONE ?? 'agent-phone'
       if (!Bun.which(phone)) throw new Error(`${phone} is not on PATH: run this where agent-phone is installed, or set OTR_AGENT_PHONE.`)
-      const ep = await call('POST', '/api/v1/episodes', { cohosts: true, ...(flag('topic') ? { topic: flag('topic') } : {}), ...(flag('variant') ? { variant: flag('variant') } : {}), ...(flag('guest') ? { guest: Number(flag('guest')) } : {}) })
+      // dialIn: start the episode and the recording WITHOUT ringing anyone. The
+      // hosts take half a minute to dial in and key the code, and the guest
+      // should never be first into an empty room, so the ring comes after them.
+      const ep = await call('POST', '/api/v1/episodes', { cohosts: true, dialIn: true, ...(flag('topic') ? { topic: flag('topic') } : {}), ...(flag('variant') ? { variant: flag('variant') } : {}), ...(flag('guest') ? { guest: Number(flag('guest')) } : {}) })
       // Pin both warm Kokoro workers before anyone speaks, so the first line of
       // the show is not the slow one.
       const warm = await call('POST', '/api/v1/speech/warm', { agents: ['riotcoder', 'cha0spunk'] }).catch((e: unknown) => ({ warm: [], error: e instanceof Error ? e.message : String(e) }))
-      console.log(`episode ${ep.n} (${ep.variant}): ringing ${ep.guest ? `guest #${ep.guest}` : 'Anthony'} into room ${ep.room}. Voices warm: ${(warm.warm ?? []).join(', ') || `none (${warm.error ?? 'gateway said no'})`}`)
+      console.log(`episode ${ep.n} (${ep.variant}): recording room ${ep.room}. Voices warm: ${(warm.warm ?? []).join(', ') || `none (${warm.error ?? 'gateway said no'})`}`)
       const plan = await call('GET', `/api/v1/episodes/${ep.n}/cohosts`)
       const dir = `${process.env.HOME}/.local/share/offtherecord/legs`
       await Bun.$`mkdir -p ${dir}`.quiet()
@@ -101,6 +104,10 @@ try {
         // The lead host goes in first, and two legs never key the code at once.
         await Bun.sleep(4000)
       }
+      // Both legs are dialling; ring the guest as soon as one of them is in the room.
+      console.log(`  waiting for a host to reach room ${plan.room}, then ringing ${ep.guest ? `guest #${ep.guest}` : 'Anthony'}...`)
+      const rung = await call('POST', `/api/v1/episodes/${plan.episode}/ring`)
+      console.log(`  ringing now: pick up and press 1. Episode ${rung.n} is ${rung.status}.`)
       console.log(`watch: tail -f ${dir}/ep${plan.episode}-*.out    then: otr show ${plan.episode}`)
       break
     }

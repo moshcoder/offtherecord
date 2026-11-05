@@ -207,8 +207,8 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
   app.post(
     '/api/v1/episodes',
     admin(async (c) => {
-      const b = (await c.req.json().catch(() => ({}))) as { topic?: string; variant?: string; guest?: number; open?: boolean; cohosts?: boolean }
-      return c.json(json(await show.start({ ...(b.topic ? { topic: String(b.topic) } : {}), ...(b.variant ? { variant: String(b.variant) } : {}), ...(b.guest ? { guest: Number(b.guest) } : {}), ...(b.open ? { open: true } : {}), ...(b.cohosts ? { cohosts: true } : {}) })), 202)
+      const b = (await c.req.json().catch(() => ({}))) as { topic?: string; variant?: string; guest?: number; open?: boolean; cohosts?: boolean; dialIn?: boolean }
+      return c.json(json(await show.start({ ...(b.topic ? { topic: String(b.topic) } : {}), ...(b.variant ? { variant: String(b.variant) } : {}), ...(b.guest ? { guest: Number(b.guest) } : {}), ...(b.open ? { open: true } : {}), ...(b.cohosts ? { cohosts: true } : {}), ...(b.dialIn ? { dialIn: true } : {}) })), 202)
     }),
   )
   app.get('/api/v1/episodes/:n{[0-9]+}', admin((c) => c.json({ ...json(store.episode(Number(c.req.param('n')))), notes: store.episode(Number(c.req.param('n')))?.notes })))
@@ -276,6 +276,8 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
     }),
   )
   app.get('/api/v1/speech/sessions', admin(async (c) => c.json((await speech?.list()) ?? { error: 'no gateway' })))
+  /** Ring the guest now that the co-hosts are in the room. */
+  app.post('/api/v1/episodes/:n{[0-9]+}/ring', admin(async (c) => c.json(json(await show.ringWhenHostsAreOn(Number(c.req.param('n')))))))
   /** What the operator's box needs to put riotcoder and cha0spunk on the line. */
   app.get('/api/v1/episodes/:n{[0-9]+}/cohosts', admin(async (c) => c.json(await show.cohostPlan(Number(c.req.param('n'))))))
 
