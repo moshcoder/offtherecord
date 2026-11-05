@@ -114,9 +114,17 @@ export function wavSeconds(wav: Uint8Array): number {
  * expects, and held under the peak ceiling so it never clips.
  */
 export const PEAK_CEILING_DBFS = -1
-export const RMS_TARGET_DBFS = -18
+/**
+ * Telephony is a loud, compressed medium: a hosted TTS sends a line far hotter
+ * than Kokoro renders it, and peak-normalising alone cannot close the gap —
+ * speech has a 15 dB crest factor, so the peaks hit the ceiling while the body
+ * of the line is still quiet. Hence a target well above where peak
+ * normalisation lands, and a soft limiter to pay for it (Anthony, twice, on air:
+ * "voice are not loud enough on group call").
+ */
+export const RMS_TARGET_DBFS = -15
 /** Never apply more than this, or quiet passages turn into noise. */
-export const MAX_GAIN_DB = 20
+export const MAX_GAIN_DB = 24
 
 const dbToGain = (db: number) => 10 ** (db / 20)
 
@@ -137,8 +145,10 @@ function dataChunk(wav: Uint8Array): { at: number; length: number } | null {
 /**
  * Level one 16-bit PCM WAV in place and say what gain was applied.
  *
- * Peak-normalised to the ceiling, then lifted further towards the RMS target
- * if it is still quiet, with the ceiling always winning so nothing clips.
+ * Gain is chosen by RMS, not by peak, so the body of the line reaches the
+ * target; whatever that sends over the ceiling is rounded off by a tanh
+ * saturator rather than clipped square. Speech peaks are sparse, so the
+ * saturation is inaudible where plain clipping would buzz.
  */
 export function levelWav(wav: Uint8Array): number {
   const data = dataChunk(wav)
@@ -154,12 +164,13 @@ export function levelWav(wav: Uint8Array): number {
   if (!peak || !samples.length) return 0
   const rms = Math.sqrt(sumSquares / samples.length)
   const ceiling = dbToGain(PEAK_CEILING_DBFS)
-  // As loud as the ceiling allows, but no louder than the RMS target wants.
-  const wanted = rms > 0 ? dbToGain(RMS_TARGET_DBFS) / rms : ceiling / peak
-  const gain = Math.min(ceiling / peak, Math.max(1, wanted), dbToGain(MAX_GAIN_DB))
+  const gain = Math.min(Math.max(1, rms > 0 ? dbToGain(RMS_TARGET_DBFS) / rms : 1), dbToGain(MAX_GAIN_DB))
   if (gain <= 1.01) return 0
   for (let i = 0; i < samples.length; i++) {
-    samples[i] = Math.max(-32768, Math.min(32767, Math.round(samples[i]! * gain)))
+    const x = (samples[i]! / 32768) * gain
+    // Linear until it nears the ceiling, then bent smoothly into it.
+    const y = Math.abs(x) <= ceiling * 0.7 ? x : Math.sign(x) * ceiling * Math.tanh(Math.abs(x) / ceiling)
+    samples[i] = Math.max(-32768, Math.min(32767, Math.round(y * 32768)))
   }
   return Math.round(20 * Math.log10(gain) * 10) / 10
 }
