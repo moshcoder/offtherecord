@@ -21,6 +21,8 @@
  *
  * OTR_ADMIN_KEY signs every call; OTR_URL points at another instance.
  */
+import { openSync } from 'node:fs'
+
 const base = (process.env.OTR_URL ?? 'https://offtherecord.podcast.pit.world').replace(/\/+$/, '')
 const key = process.env.OTR_ADMIN_KEY
 const [cmd, ...rest] = process.argv.slice(2)
@@ -92,10 +94,12 @@ try {
           '--json',
           ...(leg.from ? ['--from', leg.from] : []),
         ]
-        const log = Bun.file(out).writer()
+        // A real descriptor, not a FileSink: Bun.spawn takes 'inherit', 'ignore'
+        // or an fd, and a sink throws ERR_INVALID_ARG_TYPE at launch.
+        const fd = openSync(out, 'a')
         Bun.spawn([phone, ...args], {
-          stdout: log as unknown as number,
-          stderr: log as unknown as number,
+          stdout: fd,
+          stderr: fd,
           env: { ...process.env, AGENT_PHONE_VOICE_ENGINE: 'c0mpute', AGENT_PHONE_SPEECH_URL: base, AGENT_PHONE_SPEECH_KEY: key! },
           // The episode outlives this command.
           stdin: 'ignore',
