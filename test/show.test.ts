@@ -462,3 +462,45 @@ describe('error and drop recovery', () => {
     }
   })
 })
+
+describe('show notes', () => {
+  const transcript = 'riotcoder (host): Welcome to the show.\nAnthony: Thanks for having me. '.repeat(10)
+  const ep = (_show: unknown, _store: Store) => ({ n: 1, topic: 'Moshpit', variant: 'deep', guestId: null }) as any
+
+  test('come from c0mpute first, with the instructions after the transcript', async () => {
+    const asked: any[] = []
+    const ai = { generateObject: async (req: any) => (asked.push(req), { object: req.schema({ title: ' Names on a new internet ', notes: 'What was said.' }), provider: 'c0mpute', model: 'm' }) }
+    const gemini: string[] = []
+    const { show, store } = setup({ ai, geminiKey: 'g', fetch: (async (u: string) => (gemini.push(String(u)), new Response('{}'))) as any })
+    const notes = await show.writeNotes(ep(show, store), transcript)
+    expect(notes).toEqual({ title: 'Names on a new internet', notes: 'What was said.' })
+    expect(gemini).toEqual([])
+    expect(asked[0].user.indexOf('<transcript>')).toBeLessThan(asked[0].user.indexOf('write JSON'))
+  })
+
+  test('a long transcript keeps its opening and its close for c0mpute', async () => {
+    let user = ''
+    const ai = { generateObject: async (req: any) => ((user = req.user), { object: { title: 't', notes: 'n' }, provider: 'c0mpute', model: 'm' }) }
+    const { show, store } = setup({ ai })
+    const long = `FIRST LINE\n${'x'.repeat(100_000)}\nLAST LINE`
+    await show.writeNotes(ep(show, store), long)
+    expect(user).toContain('FIRST LINE')
+    expect(user).toContain('LAST LINE')
+    expect(user.length).toBeLessThan(30_000)
+  })
+
+  test('fall back to Gemini when c0mpute fails, and to plain notes without either', async () => {
+    const ai = { generateObject: async () => { throw new Error('no free node') } }
+    const gemini = (async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ title: 'From Gemini', notes: 'Gemini notes.' }) }] } }] }))) as any
+    const a = setup({ ai, geminiKey: 'g', fetch: gemini })
+    expect(await a.show.writeNotes(ep(a.show, a.store), transcript)).toEqual({ title: 'From Gemini', notes: 'Gemini notes.' })
+    const b = setup({ ai })
+    expect((await b.show.writeNotes(ep(b.show, b.store), transcript)).title).toBe('Moshpit')
+  })
+
+  test('a c0mpute key alone is enough: no Gemini key needed', async () => {
+    const ai = { generateObject: async () => ({ object: { title: 'Only c0mpute', notes: 'n' }, provider: 'c0mpute', model: 'm' }) }
+    const { show, store } = setup({ ai })
+    expect((await show.writeNotes(ep(show, store), transcript)).title).toBe('Only c0mpute')
+  })
+})

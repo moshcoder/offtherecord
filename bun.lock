@@ -5,6 +5,7 @@
     "": {
       "name": "@profullstack/offtherecord",
       "dependencies": {
+        "@profullstack/ai-providers": "0.2.0",
         "@profullstack/footer": "latest",
         "hono": "^4.13.14",
       },
@@ -15,6 +16,8 @@
     },
   },
   "packages": {
+    "@profullstack/ai-providers": ["@profullstack/ai-providers@0.2.0", "", { "bin": { "ai-providers": "src/cli.js" } }, "sha512-xY7a4gHThur7uTUnmzft47TnqVK+NVA57K60LThSAeHhITbSNLhkt9Sp7uNKCSg0wC55b5wLFEFGsGzblCiT6Q=="],
+
     "@profullstack/footer": ["@profullstack/footer@0.6.11", "", { "peerDependencies": { "react": ">=18" }, "optionalPeers": ["react"], "bin": { "profullstack-footer": "bin/profullstack-footer.js" } }, "sha512-9khfQbBM2p5cqMqUg8+K1atF2muYWA0AQaVI6C8gH6Cl+D+7Wc2zeaPmtDMque8HZzA3tdaqoCAAUfsufaL17Q=="],
 
     "@types/bun": ["@types/bun@1.4.4", "", { "dependencies": { "bun-types": "1.4.4" } }, "sha512-9wkRDXUXK124pEnAutE6n/l18j+i9GC5IAHK8TmX/2nlySETmky0OU6yL5U8pW1AoKh++AN9auDCr647BfurjQ=="],

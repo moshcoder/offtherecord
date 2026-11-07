@@ -7,6 +7,7 @@
  * redirects here.
  */
 import { createHash, timingSafeEqual } from 'node:crypto'
+import { getAi } from '@profullstack/ai-providers'
 import { Hono, type Context } from 'hono'
 import { Store } from './db.js'
 import { episodePage, feedXml, guestPage, guestThanksPage, homePage, SITE, statsPage, type GuestForm } from './html.js'
@@ -336,6 +337,8 @@ export function serve() {
       ...(env.ELEVENLABS_API_KEY ? { elevenlabsKey: env.ELEVENLABS_API_KEY } : {}),
       ...(env.OTR_AGENT_ID ? { agentId: env.OTR_AGENT_ID } : {}),
       ...(env.GEMINI_API_KEY ? { geminiKey: env.GEMINI_API_KEY } : {}),
+      // Show notes go to c0mpute first (C0MPUTE_API_KEY), Gemini after; C0MPUTE_DISABLED=1 turns it off.
+      ...(/^(1|true|yes|on)$/i.test(env.C0MPUTE_DISABLED ?? '') ? {} : { ai: getAi() }),
       autopublish: env.OTR_AUTOPUBLISH !== '0',
       ffmpeg,
       // An abandoned or failed episode is told to the operator: the message on stdin of this command.

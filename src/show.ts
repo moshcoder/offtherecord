@@ -13,6 +13,7 @@
  *    "ready" for `otr publish`.
  */
 import { mkdirSync, renameSync, unlinkSync } from 'node:fs'
+import type { AiRouter } from '@profullstack/ai-providers'
 import type { Episode, Store } from './db.js'
 import { COHOSTS, cohostBrief, FIRST_MESSAGE, hostPrompt, pickTopic, pickVariant, variant } from './variants.js'
 
@@ -74,6 +75,11 @@ export type Config = {
   /** Sent by the host's clock tool, so only it can read the clock. */
   hostToolSecret: string
   geminiKey?: string
+  /**
+   * Show notes on c0mpute (@profullstack/ai-providers), tried before Gemini.
+   * Absent when C0MPUTE_DISABLED is set.
+   */
+  ai?: Pick<AiRouter, 'generateObject'>
   autopublish?: boolean
   ffmpeg?: string | null
   fetch?: typeof fetch
@@ -94,6 +100,11 @@ export class ShowError extends Error {
     super(message)
   }
 }
+
+/** How much transcript c0mpute is shown: its nodes run small models with a short context. */
+const C0MPUTE_TRANSCRIPT_CHARS = 24_000
+/** c0mpute is slow (a 60k-character transcript took seven minutes); the episode waits for it. */
+const C0MPUTE_NOTES_TIMEOUT_MS = 12 * 60_000
 
 const HOST_NAME = 'riotcoder (host)'
 const DEFAULT_GUEST = 'Anthony Ettinger'
@@ -542,13 +553,21 @@ export class Show {
   /** Called every minute: pick up finished recordings. */
   async tick(): Promise<void> {
     for (const ep of this.store.inStatus('live', 'saving')) {
+      // Writing the notes on c0mpute can take minutes: a tick that starts while the
+      // last one is still on this episode must not collect it a second time.
+      if (this.collecting.has(ep.n)) continue
+      this.collecting.add(ep.n)
       try {
         await this.collect(ep)
       } catch (e) {
         this.log(`episode ${ep.n}: ${e instanceof Error ? e.message : e}`)
+      } finally {
+        this.collecting.delete(ep.n)
       }
     }
   }
+
+  private readonly collecting = new Set<number>()
 
   private async collect(ep: Episode): Promise<void> {
     const { recordings } = await this.gc<{ recordings: { id: string; status: string; mp3: string | null; duration_secs: number | null; started_at: string }[] }>('GET', `/api/v1/rooms/${ep.room}/recordings`)
@@ -651,11 +670,16 @@ export class Show {
     return (await p.exited) === 0 && Number.isFinite(Number(out)) ? Math.round(Number(out)) : null
   }
 
-  /** A title and show notes from the transcript (Gemini); plain fallbacks without it. */
+  /** A title and show notes from the transcript (c0mpute, then Gemini); plain fallbacks without either. */
   async writeNotes(ep: Episode, transcript: string): Promise<{ title: string; notes: string }> {
     const guest = (ep.guestId ? this.store.guest(ep.guestId)?.name : null) ?? DEFAULT_GUEST
     const fallback = { title: ep.topic, notes: `${variant(ep.variant).name}: ${guest} on ${ep.topic}.` }
-    if (!this.config.geminiKey || transcript.length < 200) return fallback
+    if ((!this.config.ai && !this.config.geminiKey) || transcript.length < 200) return fallback
+    if (this.config.ai) {
+      const fromC0mpute = await this.notesOnC0mpute(ep, guest, transcript)
+      if (fromC0mpute) return fromC0mpute
+    }
+    if (!this.config.geminiKey) return fallback
     const prompt = `You write titles and show notes for "Off The Record", a podcast where the AI host riotcoder interviews builders about fleet engineering, agentic coding bots and building a new internet. This episode's guest is ${guest}${guest === DEFAULT_GUEST ? ' (founder of Profullstack, the show\'s founder)' : ''}.
 
 From this transcript (machine-transcribed, so fix obvious mishearings of names), write JSON: {"title": a specific, curious title under 70 characters, no clickbait, no episode number, "notes": 3 to 5 short paragraphs of plain-text show notes: what was discussed, the best story or quote, and what listeners will take away. No markdown, no emoji, no em dashes.}
@@ -677,6 +701,47 @@ ${transcript.slice(0, 120_000)}`
       return title && notes ? { title, notes } : fallback
     } catch {
       return fallback
+    }
+  }
+
+  /**
+   * The notes from c0mpute, or null to fall through to Gemini.
+   *
+   * The peer nodes run small models with a short context that is trimmed from the
+   * front, so the instructions go AFTER the transcript (with them first, a 60k
+   * transcript came back as JSON about the episode in a shape nobody asked for),
+   * and a long transcript keeps its opening and its close.
+   */
+  private async notesOnC0mpute(ep: Episode, guest: string, transcript: string): Promise<{ title: string; notes: string } | null> {
+    const t = transcript.length > C0MPUTE_TRANSCRIPT_CHARS ? `${transcript.slice(0, C0MPUTE_TRANSCRIPT_CHARS / 2)}\n[...]\n${transcript.slice(-C0MPUTE_TRANSCRIPT_CHARS / 2)}` : transcript
+    const user = `This is the transcript of an episode of "Off The Record", a podcast where the AI host riotcoder interviews builders about fleet engineering, agentic coding bots and building a new internet. The guest is ${guest}${guest === DEFAULT_GUEST ? ' (founder of Profullstack, the show\'s founder)' : ''}. Topic: ${ep.topic}
+
+<transcript>
+${t}
+</transcript>
+
+From the transcript above (machine-transcribed, so fix obvious mishearings of names), write JSON: {"title": a specific, curious title under 70 characters, no clickbait, no episode number, "notes": 3 to 5 short paragraphs of plain-text show notes: what was discussed, the best story or quote, and what listeners will take away}. No markdown, no emoji, no em dashes. Answer with the JSON object only.`
+    try {
+      const { object, provider, model } = await this.config.ai!.generateObject({
+        user,
+        name: 'ShowNotes',
+        jsonSchema: { type: 'object', properties: { title: { type: 'string' }, notes: { type: 'string' } }, required: ['title', 'notes'] },
+        schema: (v: unknown) => {
+          const o = (v ?? {}) as { title?: unknown; notes?: unknown }
+          const title = String(o.title ?? '').trim().slice(0, 100)
+          const notes = String(o.notes ?? '').trim().slice(0, 5000)
+          if (!title || !notes) throw new Error('show notes need a title and notes')
+          return { title, notes }
+        },
+        maxTokens: 1500,
+        feature: 'otr-show-notes',
+        timeoutMs: C0MPUTE_NOTES_TIMEOUT_MS,
+      })
+      this.log(`episode ${ep.n}: notes by ${provider} ${model}`)
+      return object
+    } catch (e) {
+      this.log(`episode ${ep.n}: c0mpute notes failed, trying Gemini: ${e instanceof Error ? e.message : e}`)
+      return null
     }
   }
 
