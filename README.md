@@ -14,7 +14,7 @@ A long-form podcast: riotcoder, an AI host (an ElevenLabs agent), interviews Ant
 3. The host calls `check_clock` (`GET /api/host/clock`) to land on time, then `end_call`.
 4. When the call ends, group.call saves the mp3. Every minute the server picks it up,
    levels it to -16 LUFS with ffmpeg, and writes a title and show notes from the
-   speaker-labelled transcript (Gemini).
+   speaker-labelled transcript (c0mpute first, `C0MPUTE_API_KEY`; Gemini if that fails).
 5. It publishes itself as soon as it is ready (set `OTR_AUTOPUBLISH=0` to hold it as `ready` for `otr publish <n>`).
 
 ## Drops and errors
