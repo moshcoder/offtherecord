@@ -101,10 +101,15 @@ export class ShowError extends Error {
   }
 }
 
-/** How much transcript c0mpute is shown: its nodes run small models with a short context. */
-const C0MPUTE_TRANSCRIPT_CHARS = 24_000
-/** c0mpute is slow (a 60k-character transcript took seven minutes); the episode waits for it. */
-const C0MPUTE_NOTES_TIMEOUT_MS = 12 * 60_000
+/**
+ * How much transcript c0mpute is shown. Its nodes run small models with a short
+ * context, read the prompt at CPU speed, and Infernet ends a stream at 600 s: 24k
+ * characters answered in 385 s on a quiet network and not at all (600 s, no first
+ * token) on episode 9 under load.
+ */
+const C0MPUTE_TRANSCRIPT_CHARS = 12_000
+/** Infernet ends a c0mpute stream at 600 s, so waiting longer buys nothing. */
+const C0MPUTE_NOTES_TIMEOUT_MS = 10 * 60_000
 
 const HOST_NAME = 'riotcoder (host)'
 const DEFAULT_GUEST = 'Anthony Ettinger'

@@ -486,7 +486,7 @@ describe('show notes', () => {
     await show.writeNotes(ep(show, store), long)
     expect(user).toContain('FIRST LINE')
     expect(user).toContain('LAST LINE')
-    expect(user.length).toBeLessThan(30_000)
+    expect(user.length).toBeLessThan(15_000)
   })
 
   test('fall back to Gemini when c0mpute fails, and to plain notes without either', async () => {
