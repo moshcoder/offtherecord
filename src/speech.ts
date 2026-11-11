@@ -34,27 +34,51 @@ export const TTL_MS = 10 * 60 * 1000
 /** The longest line we ask a node to read in one go. */
 const MAX_CHARS = 2000
 
-/** Voices the gateway's Kokoro engine serves. */
+/** Voices the gateway's Kokoro engine serves (the fallback). */
 export const KOKORO_VOICES = ['af_sarah', 'af_bella', 'af_nicole', 'am_onyx', 'am_michael', 'am_echo'] as const
 
+/** Voices the gateway's Pocket engine serves (the default). */
+export const POCKET_VOICES = ['alba', 'anna', 'caro_davy', 'marius', 'javert', 'bill_boerst', 'peter_yearsley', 'stuart_bell'] as const
+
 /**
- * Each co-host's voice, as its OpenProfile declares it (the same map c0mpute
- * keeps in speech_profiles.rs). Voice presentation is an explicit synthetic
- * choice, not a claim about the agent.
+ * Each agent's DEFAULT voice: Pocket TTS, as c0mpute's speech_profiles.rs
+ * names it. Pocket replaced Kokoro on 2026-11-11 (Anthony: "its still
+ * computerish. we need to be more human ... use that for default voices
+ * everywhere"). Voice presentation is an explicit synthetic choice, not a
+ * claim about the agent.
  */
 export const AGENT_VOICES: Record<string, string> = {
+  riotcoder: 'bill_boerst',
+  cha0spunk: 'caro_davy',
+  knox: 'stuart_bell',
+  rootkey: 'javert',
+  coinpay: 'marius',
+}
+
+/** The Kokoro voice each agent drops to when no Pocket worker can speak. */
+export const FALLBACK_VOICES: Record<string, string> = {
   riotcoder: 'am_michael',
   cha0spunk: 'af_bella',
   knox: 'af_sarah',
   rootkey: 'am_onyx',
+  coinpay: 'am_echo',
 }
 
-export const DEFAULT_VOICE = 'am_michael'
+export const DEFAULT_VOICE = 'bill_boerst'
+export const DEFAULT_FALLBACK_VOICE = 'am_michael'
 
-/** The voice an agent speaks in, falling back to riotcoder's. */
+const agentKey = (agent: string) => agent.trim().toLowerCase().replace(/^@/, '')
+
+/** The voice an agent speaks in by default (Pocket), falling back to riotcoder's. */
 export function voiceFor(agent: string): string {
-  const voice = AGENT_VOICES[agent.trim().toLowerCase().replace(/^@/, '')]
-  return voice && (KOKORO_VOICES as readonly string[]).includes(voice) ? voice : DEFAULT_VOICE
+  const voice = AGENT_VOICES[agentKey(agent)]
+  return voice && (POCKET_VOICES as readonly string[]).includes(voice) ? voice : DEFAULT_VOICE
+}
+
+/** The agent's Kokoro voice, used when Pocket is unavailable. */
+export function fallbackVoiceFor(agent: string): string {
+  const voice = FALLBACK_VOICES[agentKey(agent)]
+  return voice && (KOKORO_VOICES as readonly string[]).includes(voice) ? voice : DEFAULT_FALLBACK_VOICE
 }
 
 export type SpeechConfig = {
@@ -224,6 +248,8 @@ function looksLikeSpeech(wav: Uint8Array): boolean {
 export class Speech {
   /** One warm session per voice, reopened whenever the gateway loses it. */
   private sessions = new Map<string, Session>()
+  /** Voices whose session would not open, and when to try them again. */
+  private unavailable = new Map<string, number>()
   private opening = new Map<string, Promise<Session | null>>()
 
   constructor(readonly config: SpeechConfig) {
@@ -254,6 +280,8 @@ export class Speech {
   private async open(voice: string): Promise<Session | null> {
     const pending = this.opening.get(voice)
     if (pending) return pending
+    // A node without Pocket refuses at once; do not ask again for every line.
+    if ((this.unavailable.get(voice) ?? 0) > Date.now()) return null
     const attempt = (async () => {
       try {
         const res = await this.fetch(this.url('/v1/sessions'), {
@@ -266,11 +294,13 @@ export class Speech {
         const body = (await res.json()) as { session?: string; load_ms?: number }
         if (!body.session) throw new Error('no session id')
         this.log(`warm session for ${voice} in ${body.load_ms ?? '?'} ms`)
+        this.unavailable.delete(voice)
         const session: Session = { id: body.session, voice, utterances: 0 }
         this.sessions.set(voice, session)
         return session
       } catch (e) {
         this.log(`could not open a ${voice} session: ${e instanceof Error ? e.message : e}`)
+        this.unavailable.set(voice, Date.now() + 5 * 60 * 1000)
         return null
       } finally {
         this.opening.delete(voice)
@@ -284,8 +314,12 @@ export class Speech {
   async warm(agents: string[]): Promise<string[]> {
     const ready: string[] = []
     for (const agent of agents) {
-      const voice = voiceFor(agent)
-      if ((this.sessions.get(voice) ?? (await this.open(voice))) !== null) ready.push(voice)
+      for (const voice of [voiceFor(agent), fallbackVoiceFor(agent)]) {
+        if ((this.sessions.get(voice) ?? (await this.open(voice))) !== null) {
+          ready.push(voice)
+          break
+        }
+      }
     }
     return ready
   }
@@ -320,18 +354,26 @@ export class Speech {
    */
   async say(agent: string, text: string, id: string, opts: { level?: boolean } = {}): Promise<SpokenLine | null> {
     const line = text.trim()
-    const voice = voiceFor(agent)
     if (!this.config.baseUrl || !this.config.token || !line || line.length > MAX_CHARS) return null
 
-    let session = this.sessions.get(voice) ?? (await this.open(voice))
-    if (!session) return null
-    let said = await this.sayOnce(session, line)
-    if (said === 'gone') {
-      this.sessions.delete(voice)
-      session = await this.open(voice)
-      said = session ? await this.sayOnce(session, line) : null
+    // Pocket first; the agent's Kokoro voice when no Pocket worker can speak.
+    let voice = ''
+    let session: Session | null = null
+    let said: { wav: Uint8Array; synthMs: number } | 'gone' | null = null
+    for (const candidate of [voiceFor(agent), fallbackVoiceFor(agent)]) {
+      voice = candidate
+      session = this.sessions.get(voice) ?? (await this.open(voice))
+      if (!session) continue
+      said = await this.sayOnce(session, line)
+      if (said === 'gone') {
+        this.sessions.delete(voice)
+        session = await this.open(voice)
+        said = session ? await this.sayOnce(session, line) : null
+      }
+      if (session && said && said !== 'gone' && looksLikeSpeech(said.wav)) break
+      said = null
     }
-    if (!session || !said || said === 'gone' || !looksLikeSpeech(said.wav)) return null
+    if (!session || !said) return null
     session.utterances += 1
     // A phone leg wants the line levelled; a file render (TUI Weekly) masters
     // the whole episode itself and wants Kokoro exactly as it rendered.

@@ -9,7 +9,7 @@
 import { describe, expect, test } from 'bun:test'
 import { Store } from '../src/db.ts'
 import { createApp } from '../src/server.ts'
-import { audioToken, levelWav, softLimit, PEAK_CEILING_DBFS, RMS_TARGET_DBFS, Speech, voiceFor, wavSeconds } from '../src/speech.ts'
+import { audioToken, fallbackVoiceFor, levelWav, softLimit, PEAK_CEILING_DBFS, RMS_TARGET_DBFS, Speech, voiceFor, wavSeconds } from '../src/speech.ts'
 import { cohostBrief, COHOSTS } from '../src/variants.ts'
 
 /** A valid 16-bit mono WAV of `samples` frames at 24 kHz, as Kokoro returns. */
@@ -32,7 +32,7 @@ function wav(samples = 2400): Uint8Array {
 }
 
 /** A fake c0mpute speech gateway: warm sessions, one WAV per `say`. */
-function gateway(opts: { loseSessionOnce?: boolean; junk?: boolean; openFails?: boolean } = {}) {
+function gateway(opts: { loseSessionOnce?: boolean; junk?: boolean; openFails?: boolean; noPocket?: boolean } = {}) {
   const calls: { method: string; path: string; body: any }[] = []
   let opened = 0
   let lost = opts.loseSessionOnce ?? false
@@ -43,6 +43,9 @@ function gateway(opts: { loseSessionOnce?: boolean; junk?: boolean; openFails?: 
     calls.push({ method, path: u.pathname, body })
     if (u.pathname === '/v1/sessions' && method === 'POST') {
       if (opts.openFails) return new Response('no node', { status: 503 })
+      if (opts.noPocket && !String(body.voice).includes('_m') && !String(body.voice).startsWith('a')) {
+        return new Response('this node does not serve the pocket voice', { status: 503 })
+      }
       opened += 1
       return new Response(JSON.stringify({ session: `s${opened}`, engine: 'kokoro', voice: body.voice, load_ms: 900 }), { status: 201 })
     }
@@ -127,16 +130,19 @@ function setup(opts: { live?: { kind: string; name: string }[]; gw?: ReturnType<
 
 describe('each co-host speaks in the voice its profile names', () => {
   test('riotcoder is am_michael and cha0spunk is af_bella', () => {
-    expect(voiceFor('riotcoder')).toBe('am_michael')
-    expect(voiceFor('cha0spunk')).toBe('af_bella')
+    expect(voiceFor('riotcoder')).toBe('bill_boerst')
+    expect(fallbackVoiceFor('riotcoder')).toBe('am_michael')
+    expect(voiceFor('cha0spunk')).toBe('caro_davy')
+    expect(fallbackVoiceFor('cha0spunk')).toBe('af_bella')
     // Spellings that turn up in headers and CLI flags.
-    expect(voiceFor('@RiotCoder')).toBe('am_michael')
+    expect(voiceFor('@RiotCoder')).toBe('bill_boerst')
     // An agent with no profile voice still gets a voice rather than nothing.
-    expect(voiceFor('someone-else')).toBe('am_michael')
+    expect(voiceFor('someone-else')).toBe('bill_boerst')
+    expect(fallbackVoiceFor('someone-else')).toBe('am_michael')
   })
 
   test('the show roster agrees with the voice map', () => {
-    for (const c of COHOSTS) expect(voiceFor(c.agent)).toBe(c.voice)
+    for (const c of COHOSTS) expect(fallbackVoiceFor(c.agent)).toBe(c.voice)
   })
 })
 
@@ -146,7 +152,7 @@ describe('rendering a line on c0mpute', () => {
     const speech = speechFor(gw)
     const first = await speech.say('riotcoder', 'Welcome to Off The Record.', 'ep5-1')
     const second = await speech.say('riotcoder', 'So Anthony, where did this start?', 'ep5-2')
-    expect(first?.voice).toBe('am_michael')
+    expect(first?.voice).toBe('bill_boerst')
     expect(first?.synthMs).toBe(1672)
     // 2400 frames at 24 kHz.
     expect(first?.seconds).toBe(0.1)
@@ -160,13 +166,24 @@ describe('rendering a line on c0mpute', () => {
     expect(bytes?.length).toBe(44 + 2400 * 2)
   })
 
+  test('falls back to the Kokoro voice when no node serves Pocket, and stops asking for Pocket', async () => {
+    const gw = gateway({ noPocket: true })
+    const speech = speechFor(gw)
+    const first = await speech.say('riotcoder', 'Pocket is down today.', 'np-1')
+    expect(first?.voice).toBe('am_michael')
+    await speech.say('riotcoder', 'Still talking.', 'np-2')
+    const opens = gw.calls.filter((c) => c.path === '/v1/sessions' && c.method === 'POST').map((c) => c.body.voice)
+    // One refused Pocket open, one Kokoro open, then the warm Kokoro session is reused.
+    expect(opens).toEqual(['bill_boerst', 'am_michael'])
+  })
+
   test('the other host gets its own session, so both voices stay warm', async () => {
     const gw = gateway()
     const speech = speechFor(gw)
     await speech.say('riotcoder', 'Over to you.', 'a')
     await speech.say('cha0spunk', 'Thanks, RiotCoder.', 'b')
     expect(gw.sessionsOpened()).toBe(2)
-    expect(gw.calls.filter((c) => c.path === '/v1/sessions' && c.method === 'POST').map((c) => c.body.voice)).toEqual(['am_michael', 'af_bella'])
+    expect(gw.calls.filter((c) => c.path === '/v1/sessions' && c.method === 'POST').map((c) => c.body.voice)).toEqual(['bill_boerst', 'caro_davy'])
   })
 
   test('a session the gateway has lost is reopened and the line still gets said', async () => {
@@ -190,7 +207,7 @@ describe('rendering a line on c0mpute', () => {
 
   test('warming both hosts before an episode pins both voices', async () => {
     const gw = gateway()
-    expect(await speechFor(gw).warm(['riotcoder', 'cha0spunk'])).toEqual(['am_michael', 'af_bella'])
+    expect(await speechFor(gw).warm(['riotcoder', 'cha0spunk'])).toEqual(['bill_boerst', 'caro_davy'])
     expect(gw.sessionsOpened()).toBe(2)
   })
 
@@ -213,7 +230,7 @@ describe('the speech routes', () => {
     const said = await req('POST', '/api/v1/speech/say', { agent: 'cha0spunk', text: 'Thanks for having us.', id: 'ep5-7' })
     expect(said.status).toBe(200)
     const line = (await said.json()) as { url: string; voice: string; seconds: number }
-    expect(line.voice).toBe('af_bella')
+    expect(line.voice).toBe('caro_davy')
     // Telnyx's media loader carries none of our credentials: no auth header here.
     const audio = await app.request(new URL(line.url).pathname)
     expect(audio.status).toBe(200)
@@ -236,7 +253,7 @@ describe('the speech routes', () => {
   test('warming the hosts pins both voices', async () => {
     const { req } = setup()
     const res = await req('POST', '/api/v1/speech/warm', {})
-    expect(await res.json()).toEqual({ warm: ['am_michael', 'af_bella'] })
+    expect(await res.json()).toEqual({ warm: ['bill_boerst', 'caro_davy'] })
   })
 })
 
