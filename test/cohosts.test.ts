@@ -32,7 +32,7 @@ function wav(samples = 2400): Uint8Array {
 }
 
 /** A fake c0mpute speech gateway: warm sessions, one WAV per `say`. */
-function gateway(opts: { loseSessionOnce?: boolean; junk?: boolean; openFails?: boolean; noPocket?: boolean } = {}) {
+function gateway(opts: { loseSessionOnce?: boolean; junk?: boolean; openFails?: boolean; noPocket?: boolean; gpu?: boolean } = {}) {
   const calls: { method: string; path: string; body: any }[] = []
   let opened = 0
   let lost = opts.loseSessionOnce ?? false
@@ -50,6 +50,10 @@ function gateway(opts: { loseSessionOnce?: boolean; junk?: boolean; openFails?: 
       return new Response(JSON.stringify({ session: `s${opened}`, engine: 'kokoro', voice: body.voice, load_ms: 900 }), { status: 201 })
     }
     if (u.pathname === '/v1/sessions' && method === 'GET') return new Response(JSON.stringify({ sessions: [] }))
+    if (u.pathname === '/v1/tts' && method === 'POST') {
+      if (!opts.gpu) return new Response('no worker bid on the job', { status: 503 })
+      return new Response(new Blob([wav().buffer as ArrayBuffer]))
+    }
     if (/^\/v1\/sessions\/[^/]+\/say$/.test(u.pathname) && method === 'POST') {
       if (lost) {
         lost = false
@@ -175,6 +179,23 @@ describe('rendering a line on c0mpute', () => {
     const opens = gw.calls.filter((c) => c.path === '/v1/sessions' && c.method === 'POST').map((c) => c.body.voice)
     // One refused Pocket open, one Kokoro open, then the warm Kokoro session is reused.
     expect(opens).toEqual(['bill_boerst', 'am_michael'])
+  })
+
+  test('best quality uses the GPU voice when a GPU node answers', async () => {
+    const gw = gateway({ gpu: true })
+    const line = await speechFor(gw).sayBest('riotcoder', 'Wait, really?', 'gpu-1', { level: false })
+    expect(line?.voice).toBe('chatterbox:riotcoder')
+    const tts = gw.calls.find((c) => c.path === '/v1/tts')
+    expect(tts?.body).toMatchObject({ engine: 'chatterbox', voice: 'riotcoder', exaggeration: 0.6 })
+    expect(gw.sessionsOpened()).toBe(0)
+  })
+
+  test('best quality falls back to the CPU voice, and stops asking the GPU for a while', async () => {
+    const gw = gateway()
+    const speech = speechFor(gw)
+    expect((await speech.sayBest('riotcoder', 'No GPU today.', 'cpu-1'))?.voice).toBe('bill_boerst')
+    await speech.sayBest('riotcoder', 'Still none.', 'cpu-2')
+    expect(gw.calls.filter((c) => c.path === '/v1/tts').length).toBe(1)
   })
 
   test('the other host gets its own session, so both voices stay warm', async () => {
