@@ -88,6 +88,12 @@ export type Config = {
   log?: (line: string) => void
   /** Tell the operator something went wrong for good (an episode abandoned or failed). */
   notify?: (message: string) => void
+  /**
+   * An episode was just published (the first time, not a re-publish): put it on
+   * the air elsewhere (OTR_GOLIVE_CMD, e.g. the golive CLI to nixamp,
+   * live.streaming, backtoschool.help and pairux.com/@moshcoding).
+   */
+  onPublish?: (ep: Episode) => void
   /** Wait between retries of a failed request; 10 s by default. */
   retryGapMs?: number
 }
@@ -754,7 +760,16 @@ From the transcript above (machine-transcribed, so fix obvious mishearings of na
     const ep = this.store.episode(n)
     if (!ep) throw new ShowError('No such episode.', 404)
     if (ep.status !== 'ready' && ep.status !== 'published') throw new ShowError(`Episode ${n} is ${ep.status}, not ready.`, 409)
-    return this.store.update(n, { status: 'published', publishedAt: ep.publishedAt ?? Date.now() })
+    const out = this.store.update(n, { status: 'published', publishedAt: ep.publishedAt ?? Date.now() })
+    // Only the first publish goes live; publishing again (or after an unpublish) does not re-air it.
+    if (ep.status === 'ready' && !ep.publishedAt) {
+      try {
+        this.config.onPublish?.(out)
+      } catch (e) {
+        this.log(`episode ${n}: go-live hook failed: ${e instanceof Error ? e.message : e}`)
+      }
+    }
+    return out
   }
 
   unpublish(n: number): Episode {

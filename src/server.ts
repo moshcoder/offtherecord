@@ -9,7 +9,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { getAi } from '@profullstack/ai-providers'
 import { Hono, type Context } from 'hono'
-import { Store } from './db.js'
+import { Store, type Episode } from './db.js'
 import { episodePage, feedXml, guestPage, guestThanksPage, homePage, SITE, statsPage, type GuestForm } from './html.js'
 import { startPitFooterRefresh } from './pit-footer.js'
 import { RING_PLACEHOLDER, ringBar, startRingRefresh, visitorOnMoshpit } from './ring.js'
@@ -17,6 +17,22 @@ import { ringDescriptor, startRingFooterRefresh } from './ring-footer.js'
 import { Show, ShowError, type Config } from './show.js'
 import { Speech, voiceFor } from './speech.js'
 import { VERSION } from './version.js'
+
+/**
+ * What OTR_GOLIVE_CMD is told about a newly published episode. The audio link
+ * carries ?relay=golive so a rebroadcast's own fetches are not counted as plays
+ * (plays per episode are the A/B test's measure).
+ */
+export function goLiveEnv(ep: Pick<Episode, 'n' | 'title' | 'notes'>): Record<string, string> {
+  const notes = (ep.notes ?? '').replace(/[#*_`>\[\]]/g, '').replace(/\s+/g, ' ').trim()
+  return {
+    OTR_EPISODE_N: String(ep.n),
+    OTR_EPISODE_TITLE: `Off The Record #${ep.n}: ${ep.title || 'a new episode'}`.slice(0, 200),
+    OTR_EPISODE_DESCRIPTION: `${notes.slice(0, 600)}${notes ? ' ' : ''}${SITE}/e/${ep.n}`.trim(),
+    OTR_EPISODE_URL: `${SITE}/audio/${ep.n}.mp3?relay=golive`,
+    OTR_EPISODE_PAGE: `${SITE}/e/${ep.n}`,
+  }
+}
 
 export { VERSION }
 
@@ -153,7 +169,8 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
       }
       if (start > end || start >= size) return new Response(null, { status: 416, headers: { ...base, 'content-range': `bytes */${size}` } })
     }
-    if (start === 0 && c.req.method === 'GET') {
+    // A rebroadcast (golive relaying the episode to nixamp/pairux) is not a listener.
+    if (start === 0 && c.req.method === 'GET' && !c.req.query('relay')) {
       const ua = (c.req.header('user-agent') ?? '').toLowerCase()
       store.addDownload(n, listener(c), c.req.header('sec-fetch-dest') === 'audio' || ua.includes('mozilla') ? 'web' : 'feed')
     }
@@ -343,6 +360,9 @@ export function serve() {
       ffmpeg,
       // An abandoned or failed episode is told to the operator: the message on stdin of this command.
       ...(env.OTR_NOTIFY_CMD ? { notify: (message: string) => void Bun.spawn(['sh', '-c', env.OTR_NOTIFY_CMD!], { stdin: new Blob([message]), stdout: 'ignore', stderr: 'inherit' }).exited } : {}),
+      // A newly published episode goes on the air: the command gets the episode in
+      // OTR_EPISODE_* variables (never spliced into the command text).
+      ...(env.OTR_GOLIVE_CMD ? { onPublish: (ep: Episode) => void Bun.spawn(['sh', '-c', env.OTR_GOLIVE_CMD!], { env: { ...process.env, ...goLiveEnv(ep) }, stdout: 'inherit', stderr: 'inherit' }).exited } : {}),
     },
   })
   // Finished recordings are picked up every minute; a restart mid-call loses nothing.

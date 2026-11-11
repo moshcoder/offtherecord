@@ -504,3 +504,25 @@ describe('show notes', () => {
     expect((await show.writeNotes(ep(show, store), transcript)).title).toBe('Only c0mpute')
   })
 })
+
+test('a first publish goes on the air through the go-live hook; a re-publish does not', async () => {
+  const aired: number[] = []
+  const { gc, store, show } = setup({ autopublish: true, onPublish: (ep: { n: number }) => aired.push(ep.n) })
+  gc.setLive([{ kind: 'person', name: 'Anthony' }])
+  await show.start({ topic: 'Moshpit', variant: 'sprint', wait: true })
+  gc.setRecordings([{ id: 'rec_1', status: 'ready', mp3: 'https://gc.test/api/v1/recordings/rec_1.mp3', duration_secs: 2100, started_at: new Date().toISOString() }])
+  await show.tick()
+  expect(store.episode(1)!.status).toBe('published')
+  expect(aired).toEqual([1])
+  show.unpublish(1)
+  show.publish(1)
+  expect(aired).toEqual([1])
+})
+
+test('the go-live command is told the episode, with an audio link that is not counted as a play', async () => {
+  const { goLiveEnv } = await import('../src/server.ts')
+  const env = goLiveEnv({ n: 9, title: 'Owned With My Own Keys', notes: '## Notes\nWe talk *keys*.' })
+  expect(env.OTR_EPISODE_TITLE).toBe('Off The Record #9: Owned With My Own Keys')
+  expect(env.OTR_EPISODE_URL).toBe('https://offtherecord.podcast.pit.world/audio/9.mp3?relay=golive')
+  expect(env.OTR_EPISODE_DESCRIPTION).toBe('Notes We talk keys. https://offtherecord.podcast.pit.world/e/9')
+})

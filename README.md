@@ -31,6 +31,21 @@ Nothing needs a manual restart. Every 5 seconds the server checks the live room:
   are joined in order) and held as `ready`, never autopublished, and `OTR_NOTIFY_CMD` (a
   shell command, the message on stdin) tells the operator.
 
+## Going live elsewhere
+
+`OTR_GOLIVE_CMD` (a shell command in app.env) runs once when an episode is first published,
+with the episode in `OTR_EPISODE_N`, `OTR_EPISODE_TITLE`, `OTR_EPISODE_DESCRIPTION`,
+`OTR_EPISODE_URL` and `OTR_EPISODE_PAGE` (never spliced into the command text). On dev2 it
+calls the [golive](https://github.com/profullstack/golive) CLI as anthony, which puts the
+episode on nixamp, live.streaming, backtoschool.help and pairux.com/@moshcoding:
+
+```sh
+OTR_GOLIVE_CMD='runuser -u anthony -- /home/anthony/.local/bin/golive start "$OTR_EPISODE_URL" --title "$OTR_EPISODE_TITLE" --description "$OTR_EPISODE_DESCRIPTION"'
+```
+
+The audio link carries `?relay=golive`, which the play counter skips, so a rebroadcast's own
+fetches never count as listens. A re-publish does not go live again.
+
 ## Guests
 
 Anyone can sign up at **/guest** (free): name, phone, who they are, a topic, a link, and
