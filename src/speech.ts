@@ -64,6 +64,9 @@ export const FALLBACK_VOICES: Record<string, string> = {
   coinpay: 'am_echo',
 }
 
+/** Agents with an expressive GPU voice (c0mpute engine "chatterbox", voice = slug). */
+export const GPU_VOICES = ['riotcoder', 'cha0spunk', 'rootkey', 'knox', 'coinpay', 'nora', 'quill']
+
 export const DEFAULT_VOICE = 'bill_boerst'
 export const DEFAULT_FALLBACK_VOICE = 'am_michael'
 
@@ -352,6 +355,57 @@ export class Speech {
    * it, which is never an error: the caller speaks the line another way.
    * `level: false` skips the phone levelling and returns the raw render.
    */
+  /**
+   * The best voice the network has: the agent's expressive Chatterbox voice on
+   * a GPU node (Anthony 2026-11-11: "add best qualitiy on gpus and lower
+   * quality for cpus"), else the warm Pocket/Kokoro path. One-shot and
+   * auctioned, so it suits file renders, not a live phone turn.
+   */
+  async sayBest(agent: string, text: string, id: string, opts: { level?: boolean; exaggeration?: number } = {}): Promise<SpokenLine | null> {
+    const line = text.trim()
+    const voice = agentKey(agent)
+    if (this.config.baseUrl && this.config.token && line && line.length <= MAX_CHARS && GPU_VOICES.includes(voice) && (this.unavailable.get('gpu') ?? 0) <= Date.now()) {
+      try {
+        const began = Date.now()
+        const res = await this.fetch(this.url('/v1/tts'), {
+          method: 'POST',
+          headers: this.headers,
+          body: JSON.stringify({ text: line, engine: 'chatterbox', voice, exaggeration: opts.exaggeration ?? 0.6 }),
+          signal: AbortSignal.timeout(180_000),
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 160)}`)
+        const wav = new Uint8Array(await res.arrayBuffer())
+        if (!looksLikeSpeech(wav)) throw new Error('not a WAV')
+        const cached = await this.cache(id, wav, opts.level, `chatterbox:${voice}`, Date.now() - began)
+        if (cached) return cached
+      } catch (e) {
+        this.log(`GPU voice for ${voice} unavailable, using the CPU voice: ${e instanceof Error ? e.message : e}`)
+        this.unavailable.set('gpu', Date.now() + 5 * 60 * 1000)
+      }
+    }
+    return this.say(agent, text, id, opts)
+  }
+
+  /** Level (unless asked not to) and cache a rendered line behind its HMAC path. */
+  private async cache(id: string, wav: Uint8Array, level: boolean | undefined, voice: string, synthMs: number): Promise<SpokenLine | null> {
+    const gainDb = level === false ? 0 : levelWav(wav)
+    const token = audioToken(id, this.config.secret)
+    try {
+      await writeFile(join(this.dir, `${token}.wav`), wav)
+    } catch (e) {
+      this.log(`could not cache ${token}: ${e instanceof Error ? e.message : e}`)
+      return null
+    }
+    void this.sweep()
+    return {
+      url: `${this.config.origin.replace(/\/+$/, '')}/speech/${token}.wav`,
+      seconds: wavSeconds(wav),
+      synthMs,
+      voice,
+      ...(gainDb ? { gainDb } : {}),
+    }
+  }
+
   async say(agent: string, text: string, id: string, opts: { level?: boolean } = {}): Promise<SpokenLine | null> {
     const line = text.trim()
     if (!this.config.baseUrl || !this.config.token || !line || line.length > MAX_CHARS) return null

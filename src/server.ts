@@ -273,12 +273,16 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
     '/api/v1/speech/say',
     admin(async (c) => {
       if (!speech) throw new ShowError('No c0mpute speech gateway is configured.', 503)
-      const b = (await c.req.json().catch(() => ({}))) as { agent?: string; text?: string; id?: string; level?: boolean }
+      const b = (await c.req.json().catch(() => ({}))) as { agent?: string; text?: string; id?: string; level?: boolean; quality?: string; exaggeration?: number }
       const text = String(b.text ?? '').trim()
       if (!text) throw new ShowError('text is required.')
       const agent = String(b.agent ?? 'riotcoder')
       const id = String(b.id ?? '').trim() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
-      const line = await speech.say(agent, text, id, { level: b.level !== false })
+      const opts = { level: b.level !== false }
+      // quality: 'best' = the GPU voice when a GPU node bids (file renders); else warm CPU voices.
+      const line = b.quality === 'best'
+        ? await speech.sayBest(agent, text, id, { ...opts, exaggeration: typeof b.exaggeration === 'number' ? b.exaggeration : undefined })
+        : await speech.say(agent, text, id, opts)
       if (!line) throw new ShowError(`c0mpute could not render that line in ${voiceFor(agent)}.`, 503)
       return c.json(line)
     }),
