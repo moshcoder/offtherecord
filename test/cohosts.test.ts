@@ -195,7 +195,10 @@ describe('rendering a line on c0mpute', () => {
     const speech = speechFor(gw)
     expect((await speech.sayBest('riotcoder', 'No GPU today.', 'cpu-1'))?.voice).toBe('bill_boerst')
     await speech.sayBest('riotcoder', 'Still none.', 'cpu-2')
-    expect(gw.calls.filter((c) => c.path === '/v1/tts').length).toBe(1)
+    await speech.sayBest('riotcoder', 'Nope.', 'cpu-3')
+    await speech.sayBest('riotcoder', 'Skipped now.', 'cpu-4')
+    // Three misses in a row, then the GPU is left alone for a while.
+    expect(gw.calls.filter((c) => c.path === '/v1/tts').length).toBe(3)
   })
 
   test('the other host gets its own session, so both voices stay warm', async () => {
