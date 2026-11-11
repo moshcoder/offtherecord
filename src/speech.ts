@@ -253,6 +253,8 @@ export class Speech {
   private sessions = new Map<string, Session>()
   /** Voices whose session would not open, and when to try them again. */
   private unavailable = new Map<string, number>()
+  /** GPU misses in a row; one bad sample must not cost the GPU for 5 minutes. */
+  private gpuMisses = 0
   private opening = new Map<string, Promise<Session | null>>()
 
   constructor(readonly config: SpeechConfig) {
@@ -377,10 +379,17 @@ export class Speech {
         const wav = new Uint8Array(await res.arrayBuffer())
         if (!looksLikeSpeech(wav)) throw new Error('not a WAV')
         const cached = await this.cache(id, wav, opts.level, `chatterbox:${voice}`, Date.now() - began)
-        if (cached) return cached
+        if (cached) {
+          this.gpuMisses = 0
+          return cached
+        }
       } catch (e) {
-        this.log(`GPU voice for ${voice} unavailable, using the CPU voice: ${e instanceof Error ? e.message : e}`)
-        this.unavailable.set('gpu', Date.now() + 5 * 60 * 1000)
+        this.gpuMisses += 1
+        this.log(`GPU voice for ${voice} failed (${this.gpuMisses} in a row), using the CPU voice: ${e instanceof Error ? e.message : e}`)
+        if (this.gpuMisses >= 3) {
+          this.unavailable.set('gpu', Date.now() + 5 * 60 * 1000)
+          this.gpuMisses = 0
+        }
       }
     }
     return this.say(agent, text, id, opts)
