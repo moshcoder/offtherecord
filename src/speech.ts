@@ -149,30 +149,69 @@ function dataChunk(wav: Uint8Array): { at: number; length: number } | null {
  * target; whatever that sends over the ceiling is rounded off by a tanh
  * saturator rather than clipped square. Speech peaks are sparse, so the
  * saturation is inaudible where plain clipping would buzz.
+ *
+ * The knee must be continuous. Until 0.4.8 a sample just past 0.7 x ceiling
+ * was mapped to ceiling x tanh(0.7) = 0.60 x ceiling, a step DOWN: every loud
+ * syllable was folded at the knee, about -20 dB of distortion that listeners
+ * heard as static (Anthony 2026-11-11: "this audio is static-ridden").
+ * Above the knee the curve now starts at the knee with slope 1 and bends
+ * towards the ceiling. Kokoro's output also leans positive (a slow DC skew
+ * during speech), which wastes headroom on one side; a first-order high-pass
+ * at 60 Hz takes it out before the gain is chosen.
  */
 export function levelWav(wav: Uint8Array): number {
   const data = dataChunk(wav)
   if (!data || data.length < 2) return 0
   const samples = new Int16Array(wav.buffer, wav.byteOffset + data.at, Math.floor(data.length / 2))
+  if (!samples.length) return 0
+  const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength)
+  const rate = (wav.length >= 28 && view.getUint32(24, true)) || 24000
+  const pcm = highPass(samples, rate)
   let peak = 0
   let sumSquares = 0
-  for (const sample of samples) {
-    const x = Math.abs(sample) / 32768
+  for (const v of pcm) {
+    const x = Math.abs(v)
     if (x > peak) peak = x
     sumSquares += x * x
   }
-  if (!peak || !samples.length) return 0
-  const rms = Math.sqrt(sumSquares / samples.length)
-  const ceiling = dbToGain(PEAK_CEILING_DBFS)
+  if (!peak) return 0
+  const rms = Math.sqrt(sumSquares / pcm.length)
   const gain = Math.min(Math.max(1, rms > 0 ? dbToGain(RMS_TARGET_DBFS) / rms : 1), dbToGain(MAX_GAIN_DB))
   if (gain <= 1.01) return 0
-  for (let i = 0; i < samples.length; i++) {
-    const x = (samples[i]! / 32768) * gain
-    // Linear until it nears the ceiling, then bent smoothly into it.
-    const y = Math.abs(x) <= ceiling * 0.7 ? x : Math.sign(x) * ceiling * Math.tanh(Math.abs(x) / ceiling)
-    samples[i] = Math.max(-32768, Math.min(32767, Math.round(y * 32768)))
+  for (let i = 0; i < pcm.length; i++) {
+    samples[i] = Math.max(-32768, Math.min(32767, Math.round(softLimit(pcm[i]! * gain) * 32768)))
   }
   return Math.round(20 * Math.log10(gain) * 10) / 10
+}
+
+/** Where the soft limiter starts bending, as a fraction of the ceiling. */
+const KNEE = 0.7
+
+/**
+ * Linear below the knee; above it, a tanh that leaves the knee with slope 1 and
+ * approaches the ceiling. Continuous and monotonic, so it never folds a peak.
+ */
+export function softLimit(x: number, ceiling = dbToGain(PEAK_CEILING_DBFS)): number {
+  const knee = ceiling * KNEE
+  const a = Math.abs(x)
+  if (a <= knee) return x
+  const room = ceiling - knee
+  return Math.sign(x) * (knee + room * Math.tanh((a - knee) / room))
+}
+
+/** A first-order 60 Hz high-pass: removes DC and the slow skew Kokoro adds. */
+function highPass(samples: Int16Array, rate: number): Float64Array {
+  const r = Math.exp((-2 * Math.PI * 60) / rate)
+  const out = new Float64Array(samples.length)
+  let prevX = 0
+  let prevY = 0
+  for (let i = 0; i < samples.length; i++) {
+    const x = samples[i]! / 32768
+    prevY = x - prevX + r * prevY
+    prevX = x
+    out[i] = prevY
+  }
+  return out
 }
 
 /** A WAV, not an error page: RIFF....WAVE, and long enough to be speech. */
@@ -277,8 +316,9 @@ export class Speech {
    * `id` names the cache entry; the caller makes it unique per line (the call id
    * and a counter do nicely). Returns null whenever our own network cannot do
    * it, which is never an error: the caller speaks the line another way.
+   * `level: false` skips the phone levelling and returns the raw render.
    */
-  async say(agent: string, text: string, id: string): Promise<SpokenLine | null> {
+  async say(agent: string, text: string, id: string, opts: { level?: boolean } = {}): Promise<SpokenLine | null> {
     const line = text.trim()
     const voice = voiceFor(agent)
     if (!this.config.baseUrl || !this.config.token || !line || line.length > MAX_CHARS) return null
@@ -293,7 +333,9 @@ export class Speech {
     }
     if (!session || !said || said === 'gone' || !looksLikeSpeech(said.wav)) return null
     session.utterances += 1
-    const gainDb = levelWav(said.wav)
+    // A phone leg wants the line levelled; a file render (TUI Weekly) masters
+    // the whole episode itself and wants Kokoro exactly as it rendered.
+    const gainDb = opts.level === false ? 0 : levelWav(said.wav)
 
     const token = audioToken(id, this.config.secret)
     try {

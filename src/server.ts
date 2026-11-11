@@ -256,12 +256,12 @@ export function createApp(deps: { store: Store; config: Config; adminKey: string
     '/api/v1/speech/say',
     admin(async (c) => {
       if (!speech) throw new ShowError('No c0mpute speech gateway is configured.', 503)
-      const b = (await c.req.json().catch(() => ({}))) as { agent?: string; text?: string; id?: string }
+      const b = (await c.req.json().catch(() => ({}))) as { agent?: string; text?: string; id?: string; level?: boolean }
       const text = String(b.text ?? '').trim()
       if (!text) throw new ShowError('text is required.')
       const agent = String(b.agent ?? 'riotcoder')
       const id = String(b.id ?? '').trim() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
-      const line = await speech.say(agent, text, id)
+      const line = await speech.say(agent, text, id, { level: b.level !== false })
       if (!line) throw new ShowError(`c0mpute could not render that line in ${voiceFor(agent)}.`, 503)
       return c.json(line)
     }),

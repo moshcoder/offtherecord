@@ -9,7 +9,7 @@
 import { describe, expect, test } from 'bun:test'
 import { Store } from '../src/db.ts'
 import { createApp } from '../src/server.ts'
-import { audioToken, levelWav, PEAK_CEILING_DBFS, RMS_TARGET_DBFS, Speech, voiceFor, wavSeconds } from '../src/speech.ts'
+import { audioToken, levelWav, softLimit, PEAK_CEILING_DBFS, RMS_TARGET_DBFS, Speech, voiceFor, wavSeconds } from '../src/speech.ts'
 import { cohostBrief, COHOSTS } from '../src/variants.ts'
 
 /** A valid 16-bit mono WAV of `samples` frames at 24 kHz, as Kokoro returns. */
@@ -398,9 +398,29 @@ describe('levelling a line for the phone', () => {
     expect(new Int16Array(bytes.buffer, bytes.byteOffset + 44, 2400).every((x) => x === 0)).toBe(true)
   })
 
+  test('the soft limiter never folds a peak: continuous and monotonic', () => {
+    // 0.4.7 stepped down from 0.7 to 0.60 x ceiling at the knee, which was the static.
+    let prev = -Infinity
+    for (let x = 0; x <= 4; x += 0.0005) {
+      const y = softLimit(x)
+      expect(y).toBeGreaterThanOrEqual(prev)
+      if (prev > -Infinity) expect(y - prev).toBeLessThanOrEqual(0.0005 + 1e-9)
+      prev = y
+    }
+    expect(softLimit(4)).toBeLessThan(10 ** (PEAK_CEILING_DBFS / 20))
+    expect(softLimit(-0.5)).toBeCloseTo(-softLimit(0.5), 12)
+  })
+
   test('a header with no samples is not an error', () => {
     expect(levelWav(new Uint8Array(44))).toBe(0)
     expect(levelWav(new Uint8Array(8))).toBe(0)
+  })
+
+  test('level: false returns the raw render with no gain', async () => {
+    const { req } = setup()
+    const said = await req('POST', '/api/v1/speech/say', { agent: 'riotcoder', text: 'Raw please.', id: 'raw', level: false })
+    expect(said.status).toBe(200)
+    expect(((await said.json()) as { gainDb?: number }).gainDb).toBeUndefined()
   })
 
   test('a rendered line reports the gain it was given', async () => {
