@@ -373,7 +373,7 @@ export class Speech {
           method: 'POST',
           headers: this.headers,
           body: JSON.stringify({ text: line, engine: 'chatterbox', voice, exaggeration: opts.exaggeration ?? 0.6 }),
-          signal: AbortSignal.timeout(180_000),
+          signal: AbortSignal.timeout(900_000), // a busy GPU queues the job; wait our turn instead of losing it
         })
         if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 160)}`)
         const wav = new Uint8Array(await res.arrayBuffer())
